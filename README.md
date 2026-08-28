@@ -1,106 +1,120 @@
 # Kanban
 
-Kanban is a local [Pi](https://github.com/badlogic/pi-mono) extension for keeping one selected, durable agent-work session per repository visible while work progresses. It is a Pi extension package – not a standalone CLI. Its manifest loads `src/index.ts` when Pi starts.
+Kanban is a local [Pi](https://github.com/badlogic/pi-mono) extension for a single selected, durable agent-work session per repository. It keeps the active workflow compact in `.kanban/state.json`, puts work detail in progressive plan snapshots, and gives later conversations a short durable handoff.
 
-A board persists in the repository-local `.kanban/` directory. The widget deliberately renders only the selected session, so its activity, todos, progress, model, context budget, and source files remain readable while an agent works.
+Kanban is a Pi extension package, not a standalone service. Pi loads `src/index.ts` directly from `package.json`.
 
-## Requirements
-
-- Pi 0.84.3 (the version used to develop and test this package)
-- Node.js and npm for local development
-
-## Install into Pi
-
-Install the package from an absolute path:
+## Install
 
 ```sh
 pi install /absolute/path/to/kanban
 ```
 
-Pi records a local package path; it does not copy the repository. Restart Pi to load the extension, or use Pi's `/reload` after changing the package. Start Pi from the repository where you want the `.kanban/` harness to live.
+Restart Pi after installation, or use `/reload` after editing the package. Start Pi in the repository where the `.kanban/` harness should live.
 
-## Quick start
-
-In an interactive Pi session:
+## Start a session
 
 ```text
-/kanban create Documentation refresh -- explain setup and developer workflows
+/kanban create refresh persistence and improve the session UI
 ```
 
-Creation selects the new session, sets the Pi session title, creates durable state, and queues the `refine` stage. Continue the staged workflow with the agent. It must explicitly call the `kanban_update` tool with `stage_complete` to move between stages:
+The prompt is the session brief. Kanban asks the current authenticated Pi model for a short title, then falls back to a safe local prompt summary if title generation is unavailable. It creates and selects the session, creates its plan, and begins `refine`.
+
+Before implementation, the kickoff requires the agent to run:
+
+```sh
+./init.sh
+```
+
+The staged workflow is fixed:
 
 ```text
 refine → research → grill → compose → implement → critique
 ```
 
-Stage progression is recorded and queues the next stage automatically. It is agent guidance, not a policy gate: the extension does not independently verify that every task, review, or prerequisite is complete before accepting `stage_complete`.
+Only `kanban_update` with `stage_complete` advances a stage. A final `critique` completion archives the plan and removes the completed session from `state.json`.
 
 ## Commands
 
 | Command | Behavior |
 | --- | --- |
-| `/kanban create <title> [-- <initial description>]` | Creates and selects a durable session, then starts `refine`. Put whitespace on both sides of `--` before an optional description. |
-| `/kanban list` | Opens the session picker. It does not render an all-session board; choosing a title also changes the selected session. |
-| `/kanban select` | Opens the same session picker and changes the selected session. |
-| `/kanban resume` | Opens the picker and selects that session. It switches to a different existing Pi conversation, creates a new conversation for a missing path, or only refreshes when the stored path is already current. |
-| `/kanban configure-context <provider/model> <tokens>` | Sets the explicit context-window limit used for the selected model's remaining-context display. |
+| `/kanban create <prompt>` | Generates a short title, creates and selects a durable session, then queues `refine`. |
+| `/kanban list` | Opens the title-based session picker and selects the chosen unfinished session. |
+| `/kanban select` | Opens the same picker and changes the selected session. |
+| `/kanban resume` | Resumes the saved Pi conversation when available; otherwise seeds a new conversation from `handoff.md` and the selected plan. |
 
-The picker is available only in an interactive UI and requires at least one existing session; create one first. It displays session titles, stages, and states – never UUIDs as normal controls. Use ↑/↓ or `j`/`k` to choose, Enter to confirm, and Escape to cancel.
+The picker shows title, stage, and state. Use ↑/↓ or `j`/`k`, Enter to choose, and Escape to cancel. It never exposes internal identifiers because active sessions are selected by title.
+
+## Low-noise checkpoints
+
+`kanban_update` works only on the selected session. There are no session, task, or todo IDs and no task-level actions.
+
+| Action | Use |
+| --- | --- |
+| `checkpoint` | Record one material update to scope, agent roster, compact work summary, or handoff. |
+| `stage_complete` | Record an optional checkpoint and explicitly move to the next stage, or complete the final stage. |
+
+A checkpoint may supply `inScope`, `outOfScope`, a complete `agents` roster (`name`, `role`, `status`), `work` (`done`, `current`, `next`), and a replacement `handoff` supplement. Use it at stage boundaries or when the plan materially changes—not after each tool call or todo.
+
+Kanban records externally scheduled agents but does not itself launch Pi background tasks or subagents. The widget derives the primary agent's live state from Pi and combines it with checkpointed external-agent statuses.
 
 ## Selected-session widget
 
-The widget above Pi's editor displays only the selected session:
+The task-style widget above Pi's editor intentionally shows only four things:
 
-- current stage and session state
-- primary model and recent activity
-- configured context remaining, as a bar, or `unavailable` until that model has a configured limit
-- completed/total progress and outstanding todo text
-- associated local source files
+```text
+☐ Refresh durable persistence
+  ◉ Stage 5/6 · implement
+  Context remaining  [██████████░░] 211k / 272k · 77%
+  ● Agents working 2
+```
 
-The context figure is `configured limit − Pi-reported current tokens`. A limit is a user-supplied value keyed by `provider/model`; it is not obtained from a provider catalog.
+Context capacity comes directly from Pi's active model and context-usage APIs. It no longer requires a manually configured model limit and does not display `unavailable`; immediately after compaction it uses the last known token usage, or zero if none exists yet.
 
-## Durable state and handoffs
+## Durable files
 
-The `.kanban/` folder is ignored by this repository's `.gitignore` and contains:
+`.kanban/` stays untracked and contains:
 
-- `state.json` – the canonical board state: sessions, tasks, todos, agents, reviews, selected-session mapping, model limits, and integration availability
-- `plans/<session-id>.json` – a generated per-session planning snapshot
-- `handoffs/<session-id>.md` – a generated per-session resume summary
-- `lock/` – a cooperative repository mutation lock
+- `state.json` — schema v3 canonical core state: selected unfinished session, stage, saved conversation path, agent names/roles/statuses, and timestamps.
+- `plans/YYYY-MM-DD-safe-title.json` — compact, reviewable session detail: prompt, scope boundaries, agents, work summary, status, and timestamps. Completed session plans remain here.
+- `handoff.md` — one handoff, capped at 200 lines. Its fixed rules are followed by supplemental decisions, blockers, next steps, and verification notes; it does not restate state fields.
+- `lock/` — cooperative mutation lock.
 
-The extension writes `state.json` atomically while holding its lock. It writes plan and handoff artifacts afterward, so those artifacts can temporarily lag the canonical state. Avoid sharing one board across multiple active Pi conversations: selection is repository-wide, and lifecycle updates apply to whichever session is currently selected. A crashed process can also leave a stale lock that must be cleared manually after confirming no other Pi process is mutating the board.
+Version-1 and version-2 state migrates automatically when Kanban initializes. Migration creates compact date/title plans, removes completed sessions from core state, creates the new handoff, and removes legacy UUID-named plans and `handoffs/` only after the new data is written.
 
-### Source files
+`state.json` is atomically replaced under the lock. Plan and handoff writes are individually atomic; do not hand-edit `.kanban/` while a Pi session is mutating it.
 
-Agents can associate paths explicitly through `kanban_update` with `source_file`. The widget also extracts source-shaped repository-relative paths from the session plan and handoff artifacts. It displays only paths that `fs.access()` can reach below the repository root; it does not scan the repository or show arbitrary artifact text as paths. The current check does not distinguish regular files from directories.
+## Start and finish checks
 
-### Resume behavior
+```sh
+./init.sh
+./init.sh --check
+```
 
-`/kanban resume` has three paths:
+The default command quickly reports the selected Kanban session, current branch, five most recent commit subjects, and working-tree summary. `--check` additionally validates state/plan/handoff constraints, verifies no completed session remains in `state.json`, runs `git diff --check`, `npm run typecheck`, and `npm test`.
 
-1. If the stored Pi conversation path exists and differs from the current conversation, Pi switches to it and queues the current stage.
-2. If the stored path is absent, Pi starts a new conversation seeded with the durable handoff. The kickoff is included in that seed and sent again after the replacement session starts, so the stage instruction can appear twice.
-3. If the stored path is already the current conversation, Pi only selects, names, and refreshes the session; it does not queue another kickoff.
+Neither Kanban nor `init.sh` runs `git add` or `git commit`. After a successful final check, the script and the final agent response provide a suggested commit message and affected files; the user decides whether and when to commit.
 
-The existence check is filesystem-only. The handoff is a summary, not a full board export, so `.kanban/state.json` must remain available to retain task, todo, review, and agent details.
-
-## Agent updates
-
-`kanban_update` is the agent-facing tool that records task and todo changes, dependencies, assignment, review evidence, source paths, context limits, blocks, and stage completion. Its session and task IDs are durable internal values returned to the agent; user-facing commands and the picker use session titles instead.
-
-Tasks can be marked important at creation. Reviews are accepted only for important tasks, and review evidence is persisted. If a prerequisite task fails or is cancelled, dependent tasks are marked `blocked_manual` pending manual reconsideration.
-
-## Validation
+## Development
 
 ```sh
 npm run typecheck
 npm test
 ```
 
+Read [docs/development.md](docs/development.md) before modifying persistence, workflow, TUI, `kanban_update`, or the validation script.
+
+For agent-facing reference material, use:
+
+- [Architecture and module boundaries](docs/architecture.md)
+- [Agent operating guide and checkpoint cadence](docs/agent-workflow.md)
+- [State and artifact reference](docs/state-and-artifacts.md)
+- [Troubleshooting and verification](docs/troubleshooting.md)
+
 ## Current limitations
 
-- Background-task, subagent, and question-tool availability is detected, but this package does not itself launch or orchestrate those integrations.
-- The cooperative lock has no stale-lock recovery or cross-process owner liveness check.
-- Dependencies are not cycle-checked, and blocked tasks have no dedicated unblock action.
-- `list`, `select`, and `resume` do nothing in headless mode because the picker requires an interactive Pi UI.
-- Version-2 state is trusted without runtime schema validation. Do not hand-edit or treat `.kanban/` as safe-to-share metadata: it can contain repository paths and Pi conversation paths.
+- Kanban records externally orchestrated agents but does not launch, cancel, or monitor Pi subagents/background tasks itself.
+- Session selection is repository-wide; do not use multiple active Pi conversations against the same board concurrently.
+- The cooperative lock has no stale-lock owner-liveness recovery.
+- `resume` only verifies that the saved conversation path exists; it cannot guarantee Pi can load it.
+- The model-generated title is a short independent completion. It can incur the current model's normal request cost and falls back locally on failure.

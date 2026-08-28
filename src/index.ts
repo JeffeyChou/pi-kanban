@@ -5,58 +5,154 @@ import type {
 import { access } from "node:fs/promises";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { persistSessionArtifacts, readArtifactText } from "./artifacts.js";
-import { discoverSessionFiles } from "./sources.js";
+import {
+  buildHandoff,
+  buildIdleHandoff,
+  emptyPlan,
+  readHandoff,
+  readPlan,
+  writeHandoff,
+  writePlan,
+  type PlanSnapshot,
+  type WorkSummary,
+} from "./artifacts.js";
 import {
   STAGES,
-  blockDependents,
+  advanceStage,
   createSession,
   initialize,
   load,
   mutate,
-  newTask,
-  prerequisitesComplete,
-  refreshProgress,
-  requireSession,
+  mutateAsync,
+  replaceAgents,
+  requireSelectedSession,
   selectedSession,
-  type Agent,
+  setConversation,
+  setSelectedSession,
+  type AgentRecord,
+  type KanbanState,
   type Session,
 } from "./store.js";
 import { pickSession, refreshWidget } from "./ui.js";
 
 const TOOL = "kanban_update";
-const integrations = (pi: ExtensionAPI) => {
-  const tools = new Set(pi.getActiveTools());
-  return {
-    background: tools.has("bg_run"),
-    subagents: tools.has("subagent"),
-    questions: tools.has("ask_user_question"),
-  };
-};
-const modelName = (ctx: ExtensionContext) =>
-  ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null;
-const primary = (ctx: ExtensionContext): Agent => ({
-  id: `primary:${ctx.sessionManager.getSessionId()}`,
-  kind: "primary",
-  model: modelName(ctx),
-  contextUsage: ctx.getContextUsage()?.tokens ?? null,
-  currentTask: null,
-  remainingTodos: [],
-  metricsSource: "pi-context",
+
+interface CheckpointInput {
+  action: "checkpoint" | "stage_complete";
+  inScope?: string[];
+  outOfScope?: string[];
+  agents?: AgentRecord[];
+  work?: Partial<WorkSummary>;
+  handoff?: string;
+}
+
+const AgentSchema = Type.Object({
+  name: Type.String(),
+  role: Type.String(),
+  status: StringEnum(["working", "idle", "blocked"] as const),
 });
-function syncPrimary(session: Session, ctx: ExtensionContext): void {
-  const record = primary(ctx);
-  const prior = session.agents.find((agent) => agent.id === record.id);
-  if (prior) Object.assign(prior, record);
-  else session.agents.push(record);
-  refreshProgress(session);
+const WorkSchema = Type.Object({
+  done: Type.Optional(Type.Array(Type.String())),
+  current: Type.Optional(Type.Array(Type.String())),
+  next: Type.Optional(Type.Array(Type.String())),
+});
+
+function fallbackTitle(prompt: string): string {
+  const cleaned = prompt.replace(/\s+/g, " ").trim();
+  const words = cleaned.split(" ").filter(Boolean).slice(0, 6).join(" ");
+  return (words || "Kanban session").slice(0, 72);
 }
+
+function normalizeGeneratedTitle(text: string): string | undefined {
+  const firstLine = text
+    .split(/\r?\n/, 1)[0]
+    ?.replace(/^\s*(?:title\s*:\s*)?/i, "")
+    .replace(/["'`]/g, "")
+    .replace(/[.。]+$/, "")
+    .trim();
+  if (!firstLine) return undefined;
+  const title = firstLine.split(/\s+/).slice(0, 6).join(" ").slice(0, 72);
+  return title || undefined;
+}
+
+async function generateTitle(
+  ctx: ExtensionContext,
+  prompt: string,
+): Promise<string> {
+  if (!ctx.model) return fallbackTitle(prompt);
+  try {
+    const response = await ctx.modelRegistry.complete(ctx.model, {
+      systemPrompt:
+        "Generate a concise Kanban session title. Reply with only a readable title of at most six words; do not use quotes, Markdown, or punctuation at the end.",
+      messages: [
+        {
+          role: "user",
+          content: prompt,
+          timestamp: Date.now(),
+        },
+      ],
+    });
+    const title = response.content
+      .filter((item): item is { type: "text"; text: string } => item.type === "text")
+      .map((item) => item.text)
+      .join("\n");
+    return normalizeGeneratedTitle(title) ?? fallbackTitle(prompt);
+  } catch {
+    return fallbackTitle(prompt);
+  }
+}
+
 function kickoff(session: Session): string {
-  return `Kanban session “${session.title}” is selected. Run the ${session.stage} stage now. Update tasks and todos as work progresses. When, and only when, this stage is complete, call kanban_update with action "stage_complete" and this session's internal id. Do not advance stages by assumption.`;
+  return `Kanban session “${session.title}” is selected at the ${session.stage} stage. Before implementation, run ./init.sh and read the selected plan. Use kanban_update only for a material checkpoint (scope, agent roster, work summary, or handoff) or explicit stage completion; never call it for each task or tool. When the final stage is complete, run ./init.sh --check. Never run git commit automatically: end with a suggested commit for the user to decide.`;
 }
-async function persist(cwd: string, session: Session): Promise<void> {
-  await persistSessionArtifacts(cwd, session);
+
+function checkpointHasContent(input: CheckpointInput): boolean {
+  return Boolean(
+    input.inScope ||
+      input.outOfScope ||
+      input.agents ||
+      input.work ||
+      input.handoff !== undefined,
+  );
 }
+
+function mergePlan(
+  existing: PlanSnapshot | undefined,
+  session: Session,
+  input: CheckpointInput,
+  status: PlanSnapshot["status"] = session.state,
+): PlanSnapshot {
+  const plan = existing ?? emptyPlan(session, session.title);
+  return {
+    ...plan,
+    title: session.title,
+    stage: session.stage,
+    status,
+    agents: session.agents,
+    ...(input.inScope ? { inScope: input.inScope } : {}),
+    ...(input.outOfScope ? { outOfScope: input.outOfScope } : {}),
+    work: {
+      ...plan.work,
+      ...(input.work?.done ? { done: input.work.done } : {}),
+      ...(input.work?.current ? { current: input.work.current } : {}),
+      ...(input.work?.next ? { next: input.work.next } : {}),
+    },
+    updatedAt: session.updatedAt,
+  };
+}
+
+async function writeCheckpointArtifacts(
+  cwd: string,
+  session: Session,
+  input: CheckpointInput,
+  status?: PlanSnapshot["status"],
+): Promise<void> {
+  const current = await readPlan(cwd, session.planPath);
+  await writePlan(cwd, session.planPath, mergePlan(current, session, input, status));
+  if (input.handoff !== undefined)
+    await writeHandoff(cwd, buildHandoff(input.handoff));
+}
+
 async function conversationExists(path: string | undefined): Promise<boolean> {
   if (!path) return false;
   try {
@@ -67,123 +163,85 @@ async function conversationExists(path: string | undefined): Promise<boolean> {
   }
 }
 
+async function updateConversationIfChanged(
+  ctx: ExtensionContext,
+  state: KanbanState,
+): Promise<KanbanState> {
+  const session = selectedSession(state);
+  const path = ctx.sessionManager.getSessionFile() ?? undefined;
+  if (!session || session.piConversationPath === path) return state;
+  const updated = await mutate(ctx.cwd, (current) => {
+    const currentSession = selectedSession(current);
+    if (currentSession) setConversation(currentSession, path);
+  });
+  return updated.state;
+}
+
 export default function kanban(pi: ExtensionAPI): void {
   const refresh = async (ctx: ExtensionContext) => {
-    await initialize(ctx.cwd, integrations(pi));
-    const updated = await mutate(ctx.cwd, (current) => {
-      const session = selectedSession(current);
-      if (session) {
-        syncPrimary(session, ctx);
-        session.piConversationPath =
-          ctx.sessionManager.getSessionFile() ?? undefined;
-        session.piConversationId = ctx.sessionManager.getSessionId();
-      }
-      return current;
-    });
-    const session = selectedSession(updated);
-    if (session) await persist(ctx.cwd, session);
-    await refreshWidget(ctx, updated);
-    return updated;
+    const state = await updateConversationIfChanged(ctx, await initialize(ctx.cwd));
+    await refreshWidget(ctx, state);
+    return state;
   };
+
   pi.on("session_start", async (_event, ctx) => {
     await refresh(ctx);
   });
   pi.on("model_select", async (_event, ctx) => {
     await refresh(ctx);
   });
-  pi.on("session_shutdown", async (_event, ctx) => {
-    const state = await mutate(ctx.cwd, (current) => {
-      const session = selectedSession(current);
-      if (session && session.state === "active")
-        session.currentActivity = `Interrupted during ${session.stage}`;
-      return current;
-    });
-    const session = selectedSession(state);
-    if (session) await persist(ctx.cwd, session);
-  });
   pi.on("agent_start", async (_event, ctx) => {
-    const state = await mutate(ctx.cwd, (current) => {
-      const session = selectedSession(current);
-      if (session) {
-        syncPrimary(session, ctx);
-        session.currentActivity = `Running ${session.stage}`;
-      }
-      return current;
-    });
-    await refreshWidget(ctx, state);
+    await refreshWidget(ctx, await load(ctx.cwd));
   });
-  pi.on("tool_execution_end", async (event, ctx) => {
-    const state = await mutate(ctx.cwd, (current) => {
-      const session = selectedSession(current);
-      if (!session) return current;
-      syncPrimary(session, ctx);
-      session.currentActivity = event.isError
-        ? `${event.toolName} failed`
-        : `Used ${event.toolName}`;
-      return current;
-    });
-    await refreshWidget(ctx, state);
+  pi.on("agent_end", async (_event, ctx) => {
+    await refreshWidget(ctx, await load(ctx.cwd));
+  });
+  pi.on("tool_execution_end", async (_event, ctx) => {
+    await refreshWidget(ctx, await load(ctx.cwd));
   });
 
   pi.registerCommand("kanban", {
-    description: "Create, select, resume, or configure durable Kanban sessions",
+    description: "Create, select, or resume durable Kanban sessions",
     handler: async (args, ctx) => {
       const [verb, ...rest] = args.trim().split(/\s+/);
       const body = rest.join(" ").trim();
       if (verb === "create") {
-        const [title, description] = body.split(/\s+--\s+/, 2);
-        if (!title) {
+        if (!body) {
+          ctx.ui.notify("Usage: /kanban create <prompt>", "error");
+          return;
+        }
+        const title = await generateTitle(ctx, body);
+        let created;
+        try {
+          created = await mutateAsync(ctx.cwd, async (state) => {
+            const session = await createSession(ctx.cwd, state, title);
+            setConversation(session, ctx.sessionManager.getSessionFile() ?? undefined);
+            await writePlan(ctx.cwd, session.planPath, emptyPlan(session, body));
+            await writeHandoff(ctx.cwd, buildHandoff());
+            return session;
+          });
+        } catch (error: unknown) {
           ctx.ui.notify(
-            "Usage: /kanban create <title> [-- <description>]",
+            error instanceof Error ? error.message : "Unable to create Kanban session",
             "error",
           );
           return;
         }
-        let created!: Session;
-        const state = await mutate(ctx.cwd, (current) => {
-          current.integrations = integrations(pi);
-          created = createSession(current, title, description);
-          syncPrimary(created, ctx);
-          created.piConversationPath =
-            ctx.sessionManager.getSessionFile() ?? undefined;
-          created.piConversationId = ctx.sessionManager.getSessionId();
-          return current;
-        });
-        pi.setSessionName(created.title);
-        await persist(ctx.cwd, created);
-        await refreshWidget(ctx, state);
-        ctx.ui.notify(`Created ${created.title}; starting refine.`, "info");
-        pi.sendUserMessage(kickoff(created), { deliverAs: "followUp" });
+        pi.setSessionName(created.value.title);
+        await refreshWidget(ctx, created.state);
+        ctx.ui.notify(`Created ${created.value.title}; starting refine.`, "info");
+        pi.sendUserMessage(kickoff(created.value), { deliverAs: "followUp" });
         return;
       }
-      if (verb === "configure-context") {
-        const [model, limit] = body.split(/\s+/, 2);
-        const tokens = Number(limit);
-        if (!model || !Number.isFinite(tokens) || tokens <= 0) {
-          ctx.ui.notify(
-            "Usage: /kanban configure-context <provider/model> <tokens>",
-            "error",
-          );
-          return;
-        }
-        const state = await mutate(ctx.cwd, (current) => {
-          current.modelContextLimits[model] = tokens;
-          return current;
-        });
-        await refreshWidget(ctx, state);
-        return;
-      }
+
       if (verb === "list" || verb === "select" || verb === "resume") {
         const state = await load(ctx.cwd);
         const choice = await pickSession(ctx, state.sessions);
         if (!choice) return;
-        const selected = await mutate(ctx.cwd, (current) => {
-          current.selectedSessionId = choice;
-          requireSession(current, choice);
-          return current;
-        });
-        const session = requireSession(selected, choice);
-        await persist(ctx.cwd, session);
+        const selected = await mutate(ctx.cwd, (current) =>
+          setSelectedSession(current, choice),
+        );
+        const session = selected.value;
         if (
           verb === "resume" &&
           (await conversationExists(session.piConversationPath)) &&
@@ -200,16 +258,16 @@ export default function kanban(pi: ExtensionAPI): void {
           verb === "resume" &&
           !(await conversationExists(session.piConversationPath))
         ) {
-          const durableHandoff = await readArtifactText(
-            ctx.cwd,
-            session.handoffArtifact,
-          );
-          const handoff = `Resume durable Kanban session “${session.title}”.\n\n${durableHandoff || `Handoff artifact unavailable: ${session.handoffArtifact}`}\n\n${kickoff(session)}`;
+          const [handoff, plan] = await Promise.all([
+            readHandoff(ctx.cwd),
+            readPlan(ctx.cwd, session.planPath),
+          ]);
+          const durableContext = `Resume Kanban session “${session.title}”.\n\n${handoff || "Handoff artifact unavailable."}\n\nPlan:\n${JSON.stringify(plan ?? { planPath: session.planPath }, null, 2)}`;
           await ctx.newSession({
             setup: async (manager) => {
               manager.appendMessage({
                 role: "user",
-                content: [{ type: "text", text: handoff }],
+                content: [{ type: "text", text: durableContext }],
                 timestamp: Date.now(),
               });
             },
@@ -220,183 +278,91 @@ export default function kanban(pi: ExtensionAPI): void {
           return;
         }
         pi.setSessionName(session.title);
-        await refreshWidget(ctx, selected);
+        await refreshWidget(ctx, selected.state);
         return;
       }
-      ctx.ui.notify(
-        "Usage: /kanban create | list | select | resume | configure-context",
-        "info",
-      );
+
+      ctx.ui.notify("Usage: /kanban create | list | select | resume", "info");
     },
   });
 
   pi.registerTool({
     name: TOOL,
-    label: "Kanban Update",
+    label: "Kanban Checkpoint",
     description:
-      "Persist selected-session Kanban progress. Complete a workflow stage only with stage_complete; this starts the next stage automatically.",
-    promptSnippet:
-      "Record durable Kanban progress and explicitly complete stages.",
+      "Record one concise checkpoint for the selected Kanban session, or explicitly complete its current stage. Use only at material milestones, never for individual tasks or tool calls.",
+    promptSnippet: "Record concise Kanban checkpoints and explicit stage completion.",
     promptGuidelines: [
-      "Use stage_complete only after completing the current stage. Use session ids returned by this tool only; do not present them to users.",
+      "The tool always updates the selected session; never invent or request session, task, or todo IDs.",
+      "Use checkpoint only for material scope, agent, work-summary, or handoff changes.",
+      "Use stage_complete only after the current stage is complete. At final completion, run ./init.sh --check and provide a suggested commit without committing.",
     ],
     parameters: Type.Object({
-      action: StringEnum([
-        "stage_complete",
-        "task",
-        "task_state",
-        "todo",
-        "todo_state",
-        "dependency",
-        "assign",
-        "review",
-        "evidence",
-        "block",
-        "source_file",
-        "context_limit",
-      ] as const),
-      sessionId: Type.String(),
-      taskId: Type.Optional(Type.String()),
-      todoId: Type.Optional(Type.String()),
-      text: Type.Optional(Type.String()),
-      state: Type.Optional(Type.String()),
-      prerequisiteId: Type.Optional(Type.String()),
-      agentId: Type.Optional(Type.String()),
-      importantCriteria: Type.Optional(Type.Array(Type.String())),
-      important: Type.Optional(Type.Boolean()),
-      limit: Type.Optional(Type.Number()),
+      action: StringEnum(["checkpoint", "stage_complete"] as const),
+      inScope: Type.Optional(Type.Array(Type.String())),
+      outOfScope: Type.Optional(Type.Array(Type.String())),
+      agents: Type.Optional(Type.Array(AgentSchema)),
+      work: Type.Optional(WorkSchema),
+      handoff: Type.Optional(Type.String()),
     }),
-    async execute(_id, input, _signal, _update, ctx) {
+    async execute(_id, input: CheckpointInput, _signal, _update, ctx) {
+      if (input.action === "checkpoint" && !checkpointHasContent(input))
+        throw new Error("checkpoint requires scope, agents, work, or handoff content");
+
+      let completed: Session | undefined;
       let nextStage: Session | undefined;
-      const state = await mutate(ctx.cwd, (current) => {
-        const session = requireSession(current, input.sessionId);
-        syncPrimary(session, ctx);
+      const updated = await mutateAsync(ctx.cwd, async (state) => {
+        const session = requireSelectedSession(state);
+        if (input.agents) replaceAgents(session, input.agents);
+        session.updatedAt = new Date().toISOString();
+
         if (input.action === "stage_complete") {
-          const index = STAGES.indexOf(session.stage);
-          const next = STAGES[index + 1];
-          session.evidence.push(`${session.stage} explicitly completed`);
+          const next = advanceStage(state, session);
           if (next) {
-            session.stage = next;
-            session.currentActivity = `Starting ${next}`;
             nextStage = session;
+            await writeCheckpointArtifacts(ctx.cwd, session, input);
           } else {
-            session.state = "complete";
-            session.currentActivity = "Completed";
-          }
-        } else if (input.action === "context_limit") {
-          const model = input.text ?? modelName(ctx);
-          if (!model || !input.limit || input.limit <= 0)
-            throw new Error(
-              "context_limit requires model text and positive limit",
+            completed = session;
+            await writeCheckpointArtifacts(ctx.cwd, session, input, "complete");
+            await writeHandoff(
+              ctx.cwd,
+              buildIdleHandoff({
+                title: session.title,
+                planPath: session.planPath,
+              }),
             );
-          current.modelContextLimits[model] = input.limit;
-        } else if (input.action === "source_file") {
-          if (!input.text)
-            throw new Error("source_file requires a repository-relative path");
-          if (!session.sourceFiles.includes(input.text))
-            session.sourceFiles.push(input.text);
-        } else if (input.action === "task") {
-          if (!input.text) throw new Error("task requires text");
-          const task = newTask(crypto.randomUUID(), input.text);
-          task.important = input.important ?? false;
-          task.review.status = task.important ? "pending" : "not_required";
-          session.tasks.push(task);
+          }
         } else {
-          if (!input.taskId) throw new Error(`${input.action} requires taskId`);
-          const task = session.tasks.find((item) => item.id === input.taskId);
-          if (!task) throw new Error("unknown task");
-          if (input.action === "task_state") {
-            if (
-              !input.state ||
-              ![
-                "pending",
-                "in_progress",
-                "completed",
-                "failed",
-                "cancelled",
-              ].includes(input.state)
-            )
-              throw new Error("invalid task state");
-            if (
-              ["in_progress", "completed"].includes(input.state) &&
-              !prerequisitesComplete(session, task)
-            )
-              throw new Error("task prerequisites are incomplete");
-            task.state = input.state as typeof task.state;
-            if (["failed", "cancelled"].includes(task.state))
-              blockDependents(session, task.id);
-          } else if (input.action === "todo") {
-            if (!input.text) throw new Error("todo requires text");
-            task.todos.push({
-              id: crypto.randomUUID(),
-              text: input.text,
-              state: "pending",
-              evidence: [],
-            });
-          } else if (input.action === "todo_state") {
-            const todo = task.todos.find((item) => item.id === input.todoId);
-            if (
-              !todo ||
-              !input.state ||
-              !["pending", "in_progress", "completed"].includes(input.state)
-            )
-              throw new Error("todo_state requires valid todoId and state");
-            todo.state = input.state as typeof todo.state;
-          } else if (input.action === "dependency") {
-            const prerequisite = session.tasks.find(
-              (item) => item.id === input.prerequisiteId,
-            );
-            if (!prerequisite || prerequisite === task)
-              throw new Error("dependency requires another task");
-            if (!task.prerequisites.includes(prerequisite.id))
-              task.prerequisites.push(prerequisite.id);
-            if (!prerequisite.subsequent.includes(task.id))
-              prerequisite.subsequent.push(task.id);
-          } else if (input.action === "assign") {
-            const agent = session.agents.find(
-              (item) => item.id === input.agentId,
-            );
-            if (!agent) throw new Error("assign requires existing agentId");
-            task.assignedAgent = agent.id;
-            agent.currentTask = task.id;
-            agent.remainingTodos = task.todos
-              .filter((todo) => todo.state !== "completed")
-              .map((todo) => todo.id);
-          } else if (input.action === "evidence") {
-            if (!input.text) throw new Error("evidence requires text");
-            task.evidence.push(input.text);
-          } else if (input.action === "review") {
-            if (!task.important || !input.text)
-              throw new Error("review requires an important task and evidence");
-            task.review.status = input.state === "failed" ? "failed" : "passed";
-            task.review.evidence.push(input.text);
-            session.reviews.push(input.text);
-          } else if (input.action === "block") {
-            task.state = input.state === "cancelled" ? "cancelled" : "failed";
-            blockDependents(session, task.id);
-            session.state = "blocked";
-          }
+          await writeCheckpointArtifacts(ctx.cwd, session, input);
         }
-        refreshProgress(session);
-        return current;
+        return session;
       });
-      const session = requireSession(state, input.sessionId);
-      await persist(ctx.cwd, session);
-      await refreshWidget(ctx, state);
+
+      await refreshWidget(ctx, updated.state);
       if (nextStage)
         pi.sendUserMessage(kickoff(nextStage), { deliverAs: "followUp" });
+      if (completed)
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Completed ${completed.title}. Run ./init.sh --check; do not commit automatically. Suggested commit: kanban: ${completed.title}`,
+            },
+          ],
+          details: { title: completed.title, status: "complete" },
+        };
       return {
         content: [
           {
             type: "text",
             text: nextStage
               ? `${nextStage.title}: starting ${nextStage.stage}.`
-              : "Kanban state recorded.",
+              : `Checkpoint recorded for ${updated.value.title}.`,
           },
         ],
         details: {
-          session,
-          sourceFiles: await discoverSessionFiles(ctx.cwd, session),
+          title: updated.value.title,
+          stage: nextStage?.stage ?? updated.value.stage,
         },
       };
     },
