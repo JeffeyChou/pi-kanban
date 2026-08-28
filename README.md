@@ -1,6 +1,6 @@
 # Kanban
 
-Kanban is a local [Pi](https://github.com/badlogic/pi-mono) extension for a single selected, durable agent-work session per repository. It keeps the active workflow compact in `.kanban/state.json`, puts work detail in progressive plan snapshots, and gives later conversations a short durable handoff.
+Kanban is a local [Pi](https://github.com/badlogic/pi-mono) extension for a single selected, durable agent-work session per repository. It keeps the active workflow compact in `.kanban/state.json`, puts work detail in progressive plan snapshots, and gives later conversations a short durable handoff. Kanban sessions are deliberately independent from Pi's native conversation files.
 
 Kanban is a Pi extension package, not a standalone service. Pi loads `src/index.ts` directly from `package.json`.
 
@@ -38,12 +38,12 @@ Only `kanban_update` with `stage_complete` advances a stage. A final `critique` 
 
 | Command | Behavior |
 | --- | --- |
-| `/kanban create <prompt>` | Generates a short title, creates and selects a durable session, then queues `refine`. |
-| `/kanban list` | Opens the title-based session picker and selects the chosen unfinished session. |
-| `/kanban select` | Opens the same picker and changes the selected session. |
-| `/kanban resume` | Resumes the saved Pi conversation when available; otherwise seeds a new conversation from `handoff.md` and the selected plan. |
+| `/kanban` | Opens the keyboard-driven Kanban dashboard. ↑/↓ or `j`/`k` previews a session's status; Enter selects it and opens a clean Pi conversation; Tab opens management mode, where Enter opens, `r` renames, and `x` permanently deletes after confirmation. Rename/delete return to the refreshed dashboard; only opening a session leaves it. |
+| `/kanban create <prompt>` | Generates a title, creates/selects the durable session, then opens a clean Pi conversation seeded with the plan and global handoff. |
+| `/kanban pause` / `/kanban unpause` | Marks the currently selected session `blocked` or `active` without changing its stage. |
+| `/kanban remove` | Permanently deletes the currently selected session and its plan after confirmation. |
 
-The picker shows title, stage, and state. Use ↑/↓ or `j`/`k`, Enter to choose, and Escape to cancel. It never exposes internal identifiers because active sessions are selected by title.
+The dashboard is rendered as a bordered editor-area panel, not a floating transcript overlay. Escape closes it. It never exposes internal identifiers because active sessions are selected by title.
 
 ## Low-noise checkpoints
 
@@ -65,24 +65,24 @@ The task-style widget above Pi's editor intentionally shows only four things:
 ```text
 ☐ Refresh durable persistence
   ◉ Stage 5/6 · implement
-  Context remaining  [██████████░░] 211k / 272k · 77%
+  Current Pi context  [██████████░░] 211k / 272k · 77% remaining
   ● Agents working 2
 ```
 
-Context capacity comes directly from Pi's active model and context-usage APIs. It no longer requires a manually configured model limit and does not display `unavailable`; immediately after compaction it uses the last known token usage, or zero if none exists yet.
+Context capacity comes directly from Pi's active model and context-usage APIs. This row belongs to the **current Pi conversation**, not the selected Kanban session. It no longer requires a manually configured model limit and does not display `unavailable`; immediately after compaction it uses the last known token usage for that Pi conversation, or zero if none exists yet.
 
 ## Durable files
 
 `.kanban/` stays untracked and contains:
 
-- `state.json` — schema v3 canonical core state: selected unfinished session, stage, saved conversation path, agent names/roles/statuses, and timestamps.
+- `state.json` — schema v4 canonical core state: selected unfinished session, stage, agent names/roles/statuses, and timestamps. It never stores Pi conversation paths.
 - `plans/YYYY-MM-DD-safe-title.json` — compact, reviewable session detail: prompt, scope boundaries, agents, work summary, status, and timestamps. Completed session plans remain here.
 - `handoff.md` — one handoff, capped at 200 lines. Its fixed rules are followed by supplemental decisions, blockers, next steps, and verification notes; it does not restate state fields.
 - `lock/` — cooperative mutation lock.
 
-Version-1 and version-2 state migrates automatically when Kanban initializes. Migration creates compact date/title plans, removes completed sessions from core state, creates the new handoff, and removes legacy UUID-named plans and `handoffs/` only after the new data is written.
+Version-1, version-2, and version-3 state migrates automatically when Kanban initializes. Legacy migration creates compact date/title plans, removes completed sessions from core state, creates the new handoff, and removes legacy UUID-named plans and `handoffs/` only after the new data is written. Version 3 migration preserves unfinished sessions while removing their saved Pi conversation paths.
 
-`state.json` is atomically replaced under the lock. Plan and handoff writes are individually atomic; do not hand-edit `.kanban/` while a Pi session is mutating it.
+`handoff.md` is global rather than per session. Selecting, opening, pausing, renaming, or removing one session preserves it; a newly opened Pi conversation is told that the handoff may describe a previously selected session and that its selected plan takes precedence. `state.json` is atomically replaced under the lock. Plan and handoff writes are individually atomic; do not hand-edit `.kanban/` while a Pi session is mutating it.
 
 ## Start and finish checks
 
@@ -116,5 +116,5 @@ For agent-facing reference material, use:
 - Kanban records externally orchestrated agents but does not launch, cancel, or monitor Pi subagents/background tasks itself.
 - Session selection is repository-wide; do not use multiple active Pi conversations against the same board concurrently.
 - The cooperative lock has no stale-lock owner-liveness recovery.
-- `resume` only verifies that the saved conversation path exists; it cannot guarantee Pi can load it.
+- Kanban cannot prevent Pi itself from opening or continuing a native Pi conversation; it simply does not bind that conversation to a Kanban session. The context widget reports the conversation Pi currently has open.
 - The model-generated title is a short independent completion. It can incur the current model's normal request cost and falls back locally on failure.

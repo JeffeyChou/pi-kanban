@@ -20,7 +20,7 @@ if (!existsSync(statePath)) {
   process.exit(0);
 }
 const state = JSON.parse(readFileSync(statePath, "utf8"));
-if (state.schemaVersion !== 3) {
+if (state.schemaVersion !== 4) {
   console.log(`Kanban: legacy schema v${state.schemaVersion ?? "unknown"} detected.`);
   console.log("Reload Pi or start a Kanban session to run the built-in migration before relying on this report.");
   process.exit(0);
@@ -62,11 +62,12 @@ if (!existsSync(statePath)) fail(".kanban/state.json is missing");
 if (!existsSync(handoffPath)) fail(".kanban/handoff.md is missing");
 let state;
 try { state = JSON.parse(readFileSync(statePath, "utf8")); } catch { fail("state.json is not valid JSON"); }
-if (state.schemaVersion !== 3 || !Array.isArray(state.sessions)) fail("state.json is not schema version 3");
+if (state.schemaVersion !== 4 || !Array.isArray(state.sessions)) fail("state.json is not schema version 4");
 if (state.sessions.some((session) => session.state === "complete")) fail("completed sessions must not remain in state.json");
 if (state.selectedSessionTitle && !state.sessions.some((session) => session.title === state.selectedSessionTitle)) fail("selectedSessionTitle does not name an active session");
 for (const session of state.sessions) {
   if (typeof session.title !== "string" || typeof session.planPath !== "string") fail("session title or planPath is invalid");
+  if ("piConversationPath" in session) fail("Pi conversation paths must not be stored in state.json");
   const planPath = resolve(board, session.planPath);
   if (relative(board, planPath).startsWith("..") || !relative(board, planPath).startsWith("plans/")) fail(`unsafe plan path for ${session.title}`);
   if (!existsSync(planPath)) fail(`plan is missing for ${session.title}`);

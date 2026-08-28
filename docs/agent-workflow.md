@@ -90,11 +90,11 @@ The single handoff already contains operating rules. Its supplement should be co
 
 Do not repeat the title, current stage, full agent roster, source-file list, task database, UUIDs, or a prose copy of the plan. Keep the supplied supplement well below the 200-line total-file cap; Kanban rejects oversized handoffs.
 
-## 5. Resume safely
+## 5. Open work safely
 
-`/kanban resume` first selects an unfinished session by title. If the saved Pi conversation file still exists, Pi switches to it. Otherwise Kanban seeds a new conversation with the one handoff plus selected plan and sends one kickoff.
+In `/kanban`, highlight an unfinished active session and press Enter to start a fresh Pi conversation seeded with the one global handoff and selected plan. Kanban never saves or restores a Pi conversation file.
 
-On any resumed conversation, run `./init.sh` again. The plan is durable, but repository code, branch state, and uncommitted changes may have moved since the last handoff.
+The seed says that the global handoff may describe a previously selected session. Read the selected plan as the authoritative source, then run `./init.sh` again. The plan is durable, but repository code, branch state, and uncommitted changes may have moved since the last handoff.
 
 ## 6. Finish without committing
 

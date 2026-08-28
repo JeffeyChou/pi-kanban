@@ -32,16 +32,26 @@ export interface Session {
   stage: Stage;
   state: SessionState;
   planPath: string;
-  piConversationPath?: string;
   agents: AgentRecord[];
   createdAt: string;
   updatedAt: string;
 }
 
 export interface KanbanState {
-  schemaVersion: 3;
+  schemaVersion: 4;
   selectedSessionTitle?: string;
   sessions: Session[];
+  updatedAt: string;
+}
+
+interface V3Session extends Session {
+  piConversationPath?: string;
+}
+
+interface V3State {
+  schemaVersion: 3;
+  selectedSessionTitle?: string;
+  sessions: V3Session[];
   updatedAt: string;
 }
 
@@ -90,7 +100,7 @@ export const kanbanPaths = (cwd: string) => ({
 });
 
 export const emptyState = (): KanbanState => ({
-  schemaVersion: 3,
+  schemaVersion: 4,
   sessions: [],
   updatedAt: now(),
 });
@@ -99,7 +109,16 @@ function isStage(value: unknown): value is Stage {
   return typeof value === "string" && (STAGES as readonly string[]).includes(value);
 }
 
-function isV3State(value: unknown): value is KanbanState {
+function isV4State(value: unknown): value is KanbanState {
+  return (
+    Boolean(value) &&
+    typeof value === "object" &&
+    (value as { schemaVersion?: unknown }).schemaVersion === 4 &&
+    Array.isArray((value as { sessions?: unknown }).sessions)
+  );
+}
+
+function isV3State(value: unknown): value is V3State {
   return (
     Boolean(value) &&
     typeof value === "object" &&
@@ -108,7 +127,9 @@ function isV3State(value: unknown): value is KanbanState {
   );
 }
 
-function normalizeV3State(value: KanbanState): KanbanState {
+function normalizeState(
+  value: Pick<KanbanState, "selectedSessionTitle" | "sessions" | "updatedAt">,
+): KanbanState {
   const sessions = value.sessions
     .filter(
       (session): session is Session =>
@@ -117,25 +138,28 @@ function normalizeV3State(value: KanbanState): KanbanState {
         isStage(session.stage) &&
         (session.state === "active" || session.state === "blocked"),
     )
-    .map((session) => ({
-      ...session,
-      agents: Array.isArray(session.agents)
-        ? session.agents.filter(
-            (agent): agent is AgentRecord =>
-              Boolean(agent) &&
-              typeof agent.name === "string" &&
-              typeof agent.role === "string" &&
-              ["working", "idle", "blocked"].includes(agent.status),
-          )
-        : [],
-    }));
+    .map((session) => {
+      const { piConversationPath: _ignored, ...withoutConversation } = session as V3Session;
+      return {
+        ...withoutConversation,
+        agents: Array.isArray(session.agents)
+          ? session.agents.filter(
+              (agent): agent is AgentRecord =>
+                Boolean(agent) &&
+                typeof agent.name === "string" &&
+                typeof agent.role === "string" &&
+                ["working", "idle", "blocked"].includes(agent.status),
+            )
+          : [],
+      };
+    });
   const selected = sessions.some(
     (session) => session.title === value.selectedSessionTitle,
   )
     ? value.selectedSessionTitle
     : sessions[0]?.title;
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     sessions,
     ...(selected ? { selectedSessionTitle: selected } : {}),
     updatedAt: value.updatedAt || now(),
@@ -276,9 +300,6 @@ async function migrateLegacyLocked(
       stage: isStage(item.stage) ? item.stage : "refine",
       state,
       planPath,
-      ...(item.piConversationPath
-        ? { piConversationPath: item.piConversationPath }
-        : {}),
       agents,
       createdAt,
       updatedAt: item.updatedAt || createdAt,
@@ -305,7 +326,7 @@ async function migrateLegacyLocked(
     .filter((item) => item.plan.status === "complete")
     .sort((left, right) => right.session.updatedAt.localeCompare(left.session.updatedAt))[0];
   const next: KanbanState = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     sessions: active.map((item) => item.session),
     ...(selected || active[0]
       ? { selectedSessionTitle: (selected ?? active[0])!.session.title }
@@ -336,10 +357,17 @@ async function migrateLegacyLocked(
   return next;
 }
 
+async function migrateV3Locked(cwd: string, raw: V3State): Promise<KanbanState> {
+  const next = normalizeState(raw);
+  await writeState(cwd, next);
+  return next;
+}
+
 async function ensureStateLocked(cwd: string): Promise<KanbanState> {
   const raw = await readRaw(cwd);
   if (raw === undefined) return emptyState();
-  if (isV3State(raw)) return normalizeV3State(raw);
+  if (isV4State(raw)) return normalizeState(raw);
+  if (isV3State(raw)) return migrateV3Locked(cwd, raw);
   return migrateLegacyLocked(cwd, raw as LegacyState);
 }
 
@@ -429,13 +457,34 @@ export function setSelectedSession(state: KanbanState, title: string): Session {
   return session;
 }
 
-export function setConversation(
+export function renameSession(
+  state: KanbanState,
   session: Session,
-  path: string | undefined,
+  title: string,
 ): void {
-  if (path) session.piConversationPath = path;
-  else delete session.piConversationPath;
+  const normalizedTitle = title.trim();
+  if (!normalizedTitle) throw new Error("Kanban title cannot be empty");
+  if (
+    state.sessions.some(
+      (candidate) => candidate !== session && candidate.title === normalizedTitle,
+    )
+  )
+    throw new Error(`an active Kanban session named “${normalizedTitle}” already exists`);
+  const wasSelected = state.selectedSessionTitle === session.title;
+  session.title = normalizedTitle;
+  if (wasSelected) state.selectedSessionTitle = normalizedTitle;
   session.updatedAt = now();
+}
+
+export function setSessionState(session: Session, state: SessionState): void {
+  session.state = state;
+  session.updatedAt = now();
+}
+
+export function removeSession(state: KanbanState, session: Session): void {
+  state.sessions = state.sessions.filter((item) => item !== session);
+  if (state.selectedSessionTitle === session.title)
+    state.selectedSessionTitle = state.sessions[0]?.title;
 }
 
 export function replaceAgents(
@@ -466,7 +515,6 @@ export function advanceStage(state: KanbanState, session: Session): Stage | unde
     session.updatedAt = now();
     return next;
   }
-  state.sessions = state.sessions.filter((item) => item !== session);
-  state.selectedSessionTitle = state.sessions[0]?.title;
+  removeSession(state, session);
   return undefined;
 }

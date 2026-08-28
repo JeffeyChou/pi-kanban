@@ -8,10 +8,11 @@ Use this page after checking the selected plan and handoff. Prefer the smallest 
 | No session appears in the widget or picker | All sessions completed, or no session was created. | Review `.kanban/plans/` for history; create a new session with `/kanban create <prompt>` if new work is needed. |
 | A completed session is still in `state.json` | Legacy/manual state or incomplete migration. | Do not hand-edit first. Start Pi to trigger migration, then run `./init.sh --check`; preserve a copy and make a minimal repair only if migration cannot run. |
 | `handoff.md` exceeds 200 lines | A checkpoint supplied too much continuation prose. | Condense the supplement to decisions, blockers, next steps, and validation; keep detailed work in the plan. |
-| Resume starts a new conversation unexpectedly | The saved Pi conversation path no longer exists. | This is expected fallback behavior. Read the seeded handoff and plan, then run `./init.sh` before work. |
-| Resume cannot load an existing conversation | The existence check passed but Pi could not read the session file. | Keep the plan and handoff; start or resume a new Pi conversation and let Kanban seed it from durable artifacts. |
+| `open` or `resume` starts a new conversation | Kanban sessions are intentionally independent from Pi conversation files. | This is expected. Read the selected plan, which is authoritative over the global handoff, then run `./init.sh` before work. |
+| The handoff seems to discuss another session | `handoff.md` is global and has been deliberately preserved across session selection. | Use the selected plan for the target session; the seeded Pi conversation includes the same precedence reminder. |
+| Pi opens an old chat when the application starts | Pi's own native startup/resume behavior selected that conversation. | Kanban does not bind it to a board session. Its widget only reports the current Pi context. Use `/kanban`, then Enter on a session, for a clean work conversation. |
 | The title is generic or based on the prompt | The private title completion failed or no model was selected. | This is the designed fallback. Continue unless the title would collide with another active session; then create a distinct session after resolving scope. |
-| Context bar is full just after compaction | Pi temporarily reports no token total. | Kanban uses the last known total, or zero for a new session. Wait for the next model response for a refreshed value. |
+| Current Pi context bar is full just after compaction | Pi temporarily reports no token total. | Kanban uses the last known total for this Pi conversation, or zero for a new one. Wait for the next model response for a refreshed value. |
 | External agent count is wrong | The checkpointed roster is stale, or a primary agent is idle/working differently than expected. | Send one material checkpoint with the complete current external roster. Do not add per-tool status calls. |
 | `./init.sh --check` fails plan/state validation | A session selection, plan path, JSON artifact, or handoff constraint is invalid. | Read the exact failure, restore the missing artifact or repair the smallest inconsistent record, then rerun the check. |
 | `npm test` cannot start in a restricted execution sandbox | The runner cannot create its local IPC pipe. | Run the same test command in a normal local shell or an approved environment; do not treat this as a project assertion failure without rerunning it. |
@@ -32,7 +33,7 @@ Before final handoff:
 
 The completion command performs these checks in order:
 
-1. state JSON parses as schema v3 and has a valid selected active session, if any;
+1. state JSON parses as schema v4, has no saved Pi conversation path, and has a valid selected active session, if any;
 2. no state session has `state: "complete"`;
 3. each active plan path is safe, exists under `.kanban/plans/`, and is valid JSON;
 4. `handoff.md` exists and has at most 200 physical lines;

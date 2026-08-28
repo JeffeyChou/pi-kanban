@@ -26,14 +26,14 @@ async function sandbox() {
   return mkdtemp(join(tmpdir(), "kanban-test-"));
 }
 
-test("v3 state keeps only compact active-session metadata", async () => {
+test("v4 state keeps only compact active-session metadata", async () => {
   const cwd = await sandbox();
   try {
     const created = await mutateAsync(cwd, async (state) =>
       createSession(cwd, state, "Release readiness"),
     );
     const session = created.value;
-    assert.equal(created.state.schemaVersion, 3);
+    assert.equal(created.state.schemaVersion, 4);
     assert.equal(created.state.selectedSessionTitle, "Release readiness");
     assert.deepEqual(session.agents, [
       { name: "Primary agent", role: "Coordinator", status: "idle" },
@@ -42,6 +42,7 @@ test("v3 state keeps only compact active-session metadata", async () => {
     assert.equal("id" in session, false);
     assert.equal("tasks" in session, false);
     assert.equal("sourceFiles" in session, false);
+    assert.equal("piConversationPath" in session, false);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -89,7 +90,7 @@ test("legacy state migrates plans, removes completed sessions, and retires hando
     );
 
     const migrated = await load(cwd);
-    assert.equal(migrated.schemaVersion, 3);
+    assert.equal(migrated.schemaVersion, 4);
     assert.equal(migrated.sessions.length, 1);
     assert.equal(migrated.sessions[0]!.title, "Active migration");
     assert.equal(migrated.selectedSessionTitle, "Active migration");
@@ -105,6 +106,49 @@ test("legacy state migrates plans, removes completed sessions, and retires hando
     const handoff = await readFile(join(cwd, ".kanban", "handoff.md"), "utf8");
     assert.match(handoff, /No supplementary handoff recorded\./);
     await assert.rejects(access(join(cwd, ".kanban", "handoffs")));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("v3 migration removes Pi conversation paths without changing active sessions", async () => {
+  const cwd = await sandbox();
+  try {
+    await mkdir(join(cwd, ".kanban", "plans"), { recursive: true });
+    await writeFile(
+      join(cwd, ".kanban", "plans", "2026-08-27-decoupled.json"),
+      "{}\n",
+      "utf8",
+    );
+    await writeFile(
+      join(cwd, ".kanban", "state.json"),
+      JSON.stringify({
+        schemaVersion: 3,
+        selectedSessionTitle: "Decoupled session",
+        sessions: [
+          {
+            title: "Decoupled session",
+            stage: "implement",
+            state: "active",
+            planPath: "plans/2026-08-27-decoupled.json",
+            piConversationPath: "/private/pi/old-chat.jsonl",
+            agents: [],
+            createdAt: "2026-08-27T12:00:00.000Z",
+            updatedAt: "2026-08-27T12:10:00.000Z",
+          },
+        ],
+        updatedAt: "2026-08-27T12:10:00.000Z",
+      }),
+      "utf8",
+    );
+
+    const migrated = await load(cwd);
+    assert.equal(migrated.schemaVersion, 4);
+    assert.equal(migrated.selectedSessionTitle, "Decoupled session");
+    assert.equal("piConversationPath" in migrated.sessions[0]!, false);
+    const disk = JSON.parse(await readFile(join(cwd, ".kanban", "state.json"), "utf8"));
+    assert.equal(disk.schemaVersion, 4);
+    assert.equal("piConversationPath" in disk.sessions[0], false);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
