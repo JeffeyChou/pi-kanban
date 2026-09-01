@@ -4,25 +4,32 @@ This document is for agents and maintainers who need to change Kanban without re
 
 ## System boundary
 
-Pi owns model invocation, context accounting, the active conversation, tool execution, and any external subagent/background-task facilities. Kanban is deliberately narrower: it records the selected repository-local work session and gives the active agent a compact durable workflow.
+Pi owns model invocation, context accounting, the active conversation, tool execution, and any external subagent/background-task facilities. Kanban is deliberately narrower: it records the selected repository-local work session, gives the active agent a compact durable workflow, and runs the pipeline stages (refine, research, grill, compose) in its own internal child sessions.
 
-Kanban does **not** launch, cancel, or inspect external agents. When an external scheduler creates them, the active agent records their names, roles, and statuses in a material checkpoint.
+Kanban never invokes third-party subagent/background-task tools. Installed tools (`pi-subagents` / `pi-background-tasks` / `rpiv-ask-user-question`) are only detected by name and named in the implement kickoff. When an external scheduler creates agents, the active agent records their names, roles, and statuses in a material checkpoint.
 
 | Owned by Pi | Owned by Kanban |
 | --- | --- |
-| Current model, context-window size, live context token count | Selected unfinished session and fixed workflow stage |
-| Main-agent streaming/idle state | Compact external-agent roster and role/status records |
-| Pi conversation switching and creation | Session selection, plan snapshots, handoff, and migration |
-| Tool scheduling and subagent execution | Low-frequency checkpoint contract and final-session cleanup |
+| Current model, context-window size, live context token count | Selected unfinished session, fixed workflow stage, and session `mode` |
+| Main-agent streaming/idle state | Internal pipeline child sessions (in-process or subprocess runner) and the abort registry |
+| Pi conversation switching and creation | `/kanban open`-initiated implement conversation; pipeline itself never switches conversations |
+| Tool scheduling and external subagent execution | Compact external-agent roster and role/status records |
+| Model/auth resolution for child sessions (L1 limits it to `~/.pi/agent`-registered providers) | Per-stage model config and fallback to the parent model |
 | Git commands when an agent explicitly runs them | Never automatic staging or committing |
 
 ## Component contracts
 
 | Module | Reads | Writes | Must not do |
 | --- | --- | --- | --- |
-| `src/index.ts` | Pi context, selected state, plan/handoff | Commands, checkpoints, stage transition artifacts | Keep task/todo graphs, expose durable IDs, bind Pi conversation files, or persist every tool event |
-| `src/store.ts` | `.kanban/state.json` | Locked atomic v4 state; v1/v2/v3 migration | Store work-item detail, evidence, source lists, model limits, Pi conversation paths, or completed sessions |
-| `src/artifacts.ts` | Existing plan/handoff | Atomic compact plan JSON and one bounded handoff | Duplicate state fields into the handoff |
+| `src/index.ts` | Pi context, selected state, plan/handoff | Commands, checkpoints, critique-gate mutations | Keep task/todo graphs, expose durable IDs, switch conversations mid-pipeline, or inject followUp kickoffs |
+| `src/store.ts` | `.kanban/state.json` | Locked atomic v4 state; v1/v2/v3 migration; session modes and pipeline tokens | Store work-item detail, evidence, source lists, model limits, Pi conversation paths, or completed sessions |
+| `src/artifacts.ts` | Existing plan/handoff | Atomic compact plan JSON (plus the bounded archive-time `completion` record) and one bounded handoff | Duplicate state fields into the handoff or accumulate review archives |
+| `src/orchestrator.ts` | State, workfile, config, prompt grammar | Child sessions, title-keyed abort registry, locked one-stage commits, workfile sections | Run children under the lock, auto-switch conversations, or commit without token revalidation |
+| `src/runner.ts` | Child spec | Pass-through child-session text | Throw; both backends return `ChildResult` errors |
+| `src/prompts.ts` | Stage inputs | Prompt/system-prompt text, parsed stage output | Mention `init` in stage prompts |
+| `src/config.ts` | Defaults, global + repository config files | Resolved merged `KanbanConfig` | Require a user-maintained model limit |
+| `src/capabilities.ts` | `pi.getActiveTools()` | Detected external-tool names | Invoke or configure external tools |
+| `src/workfile.ts` | `.kanban/work/<base>.md` | One `## <stage>` section at a time (300-line cap) | Write outside the protected locked-commit path |
 | `src/ui.ts` | Selected state plus live Pi context | Ephemeral widget only | Mutate durable state or scan arbitrary repository files |
 | `init.sh` | State, handoff, plans, Git metadata | No repository data | Stage, commit, or rewrite application code |
 
@@ -41,21 +48,40 @@ Artifact writes use a separate atomic replacement. A checkpoint writes its plan/
 
 The only ordinary state writes are:
 
-- create, select, rename, pause, unpause, or remove a session;
+- create, select, rename, pause, unpause, or remove a session (pause/remove/rename also abort any live pipeline run and clear its token);
 - a material `checkpoint` or `stage_complete` call;
+- an orchestrator stage commit or critique-gate mutation;
 - one-time v1/v2/v3 migration.
 
 `agent_start`, `agent_end`, and `tool_execution_end` refresh the widget but do not mutate state. This protects both disk churn and agent context from a stream of bookkeeping tool calls.
+
+## Lock protocol and pipeline commits
+
+Child sessions never run under the repository lock. The orchestrator runs each refine/research/grill/compose child lock-free, and the critique-gate child runs lock-free inside `stage_complete(critique)`; the lock is only ever held for the short commit that follows a successful child.
+
+Per child stage, exactly one locked `mutateAsync` commit happens after a successful child:
+
+1. Revalidate: session by title exists, `state === "active"`, `mode === "pipeline"`, `stage === expected`, `pipelineToken === ours`, and no abort signal.
+2. On success: write the workfile section (inside the lock, the same protected pattern as existing checkpoint artifact writes) and advance exactly one stage.
+3. On mismatch: commit nothing; notify; stop the pipeline. A late child after pause/remove/rename commits and writes nothing, so no orphan workfile is created.
+
+The critique gate follows the same shape with its own CAS generation: `stage_complete(critique)` first mints a fresh gate token in a locked mutation, then runs the gate child lock-free, and every post-gate mutation revalidates that token. All agent-owned mutations (checkpoint, every `stage_complete` variant, the gate-token mint, `/kanban complete`) include `state === "active"` and the expected stage in their locked predicate, so a paused session refuses to advance, arm/run a gate, or archive.
+
+Runner backends: the in-process runner (extension-free child session built on `DefaultResourceLoader` + `createAgentSession`) is the default; the subprocess runner (`pi -p` print mode, prompt via stdin, full `--no-*` flag parity) is the escape hatch and the `runner: "subprocess"` config choice. Both honor the resolved per-stage model. Known limitation L1: a child runtime builds auth/models from `~/.pi/agent` files, so providers registered dynamically via `pi.registerProvider` may not authenticate in a child; the runner classifies this as `errorKind: "model"` and the manual-fallback path reports it.
+
+Cross-process pause takes effect at stage boundaries: the orchestrator reloads state between stages, so a `blocked`/missing session only stops the pipeline between children, never mid-child.
 
 ## Session lifecycle
 
 1. `/kanban create <prompt>` asks the current model for a short title. A local summary fallback makes creation independent of model availability.
 2. The new v4 state record and initial plan are written. The global `handoff.md` is created only if absent, so existing continuity text is preserved.
-3. `create`, `open`, and `resume` start a fresh Pi conversation from the selected plan plus the global handoff. The seed states that the selected plan is authoritative because the handoff may describe a previously selected session.
-4. `stage_complete` advances the fixed sequence `refine → research → grill → compose → implement → critique`.
-5. Final `critique` writes the plan with `status: "complete"` and removes the session from `state.json`; it replaces `handoff.md` with standby text only when no active session remains.
+3. `create` and `/kanban open` (no argument means the selected session; blocked sessions are refused with a notify) hand the session to the orchestrator when it is in pipeline mode. Pipeline child stages (refine, research, grill, compose) run in internal child sessions, one output section per stage in the workfile; a fast-path refine `simple` verdict can skip research and grill.
+4. After the compose commit the pipeline ends with a notify — it never switches conversations itself. User-initiated `/kanban open` (or dashboard Enter) opens a fresh Pi conversation seeded with handoff + plan + workfile spec + one implement kickoff (init-start if configured, external-tools line). Manual-mode entries into implement deliver the same kickoff.
+5. `stage_complete(implement)` makes the single implement→critique transition. Final `stage_complete(critique)` runs the critique gate (pipeline mode) or the manual summary path (manual mode, or pipeline mode after a durable gate-child failure): PASS or the accepted summary writes the plan with `status: "complete"` and a bounded `completion` record, deletes the workfile, and removes the session from `state.json`; it replaces `handoff.md` with standby text only when no active session remains. See agent-workflow.md for the gate contract and its enforced attempts cap.
+6. `/kanban complete` is the escape hatch for a critiqued session while `plan.pendingCompletion` exists; it converts that record into the plan's `completion` field through the same locked completion.
+7. `pause`/`remove`/`rename` abort any live pipeline run via the title-keyed registry, unregister it, and clear the session's `pipelineToken` before mutating; `unpause` restarts nothing (a later `/kanban open` mints a new token). A recreated same-title session can never match a stale token.
 
-Because completed sessions are deliberately absent from state, dashboard management and current-session commands operate only on unfinished sessions. `remove` permanently deletes its confirmed selected session and plan. Historical review is file-based through `.kanban/plans/`.
+Because completed sessions are deliberately absent from state, dashboard management and current-session commands operate only on unfinished sessions. `remove` permanently deletes its confirmed selected session, plan, and workfile (aborting a live run first). Historical review is file-based through `.kanban/plans/`.
 
 ## Extension seams and safe changes
 
@@ -70,6 +96,6 @@ When changing a feature, preserve these seams:
 ## Non-goals
 
 - Kanban is not a general project-management database.
-- It is not a multi-conversation ownership coordinator.
-- It is not a source-file tracker, evidence archive, review engine, or model-capacity catalog.
+- It is not a multi-conversation ownership coordinator: it runs internal child sessions for pipeline stages, but the user's main conversation and Pi conversation switches stay out of its control (the pipeline ends with a notify and `/kanban open` does the only switch).
+- It is not a source-file tracker, evidence archive, or model-capacity catalog. The critique gate is a workflow gate, not an archive: the one bounded archive-time `completion` record is the only review data a plan may carry.
 - It is not allowed to commit user work automatically.

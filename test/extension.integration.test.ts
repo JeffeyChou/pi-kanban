@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import kanban from "../src/index.js";
-import { emptyPlan, readPlan, writePlan } from "../src/artifacts.js";
+import { emptyPlan, readPlan, writePlan, type PlanSnapshot } from "../src/artifacts.js";
 import {
   STAGES,
   createSession,
@@ -74,9 +74,14 @@ function context(cwd: string, overrides: Record<string, any> = {}) {
   };
 }
 
-async function addSession(cwd: string, title: string) {
+async function addSession(
+  cwd: string,
+  title: string,
+  mode?: "pipeline" | "manual",
+) {
   return mutateAsync(cwd, async (state) => {
     const session = await createSession(cwd, state, title);
+    if (mode) session.mode = mode;
     await writePlan(cwd, session.planPath, emptyPlan(session, `${title} brief`));
     return session;
   });
@@ -98,8 +103,9 @@ test("create uses a generated title, starts a clean conversation, and stores no 
     assert.equal("piConversationPath" in session, false);
     assert.match(ctx.setupMessages[0]!, /independent from Pi conversation files/i);
     assert.match(ctx.setupMessages[0]!, /Current session plan \(authoritative\)/);
-    assert.match(ctx.freshMessages[0]!, /\.\/init\.sh/);
-    assert.match(ctx.freshMessages[0]!, /Never run git commit automatically/);
+    // W4: the implement kickoff (configured init-start + detected external tools) is
+    // delivered only when implementation begins, via /kanban open at implement — not in
+    // the create seed. The create seed no longer carries a ./init.sh kickoff message.
     const initialPlan = await readPlan(cwd, session.planPath);
     assert.equal(initialPlan?.prompt, "refresh persistence and UI");
     assert.deepEqual(initialPlan?.work, { done: [], current: [], next: [] });
@@ -169,75 +175,94 @@ test("session startup refreshes a v4 board without persisting a Pi conversation 
   }
 });
 
-test("only explicit stage completion advances, and other sessions preserve the global handoff", async () => {
-  const cwd = await sandbox();
-  try {
-    const harness = extensionHarness();
-    const ctx = context(cwd);
-    const first = (await addSession(cwd, "First session")).value;
-    await addSession(cwd, "Second session");
-    await mutate(cwd, (state) => {
-      const session = state.sessions.find((item) => item.title === first.title)!;
-      state.selectedSessionTitle = session.title;
-      session.stage = "critique";
-    });
-    await harness.tool.execute(
-      "tool",
-      { action: "checkpoint", handoff: "Keep this global continuity note." },
-      undefined,
-      undefined,
-      ctx,
-    );
-    const result = await harness.tool.execute(
-      "tool",
-      { action: "stage_complete" },
-      undefined,
-      undefined,
-      ctx,
-    );
-    const state = await load(cwd);
-    assert.equal(state.sessions.length, 1);
-    assert.equal(state.sessions[0]!.title, "Second session");
-    const plan = await readPlan(cwd, first.planPath);
-    assert.equal(plan?.status, "complete");
-    const handoff = await readFile(join(cwd, ".kanban", "handoff.md"), "utf8");
-    assert.match(handoff, /Keep this global continuity note/);
-    assert.doesNotMatch(handoff, /Latest completed plan/);
-    assert.match(result.content[0]!.text, /Suggested commit/);
-  } finally {
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
-
-test("stage completion still advances through the fixed workflow before final archival", async () => {
-  const cwd = await sandbox();
-  try {
-    const harness = extensionHarness();
-    const ctx = context(cwd);
-    const session = (await addSession(cwd, "Stage workflow")).value;
-    for (const expected of STAGES.slice(1)) {
+test(
+  "only explicit stage completion advances, and other sessions preserve the global handoff",
+  async () => {
+    const cwd = await sandbox();
+    try {
+      const harness = extensionHarness();
+      const ctx = context(cwd);
+      const first = (await addSession(cwd, "First session", "manual")).value;
+      await addSession(cwd, "Second session");
+      await mutate(cwd, (state) => {
+        const session = state.sessions.find((item) => item.title === first.title)!;
+        state.selectedSessionTitle = session.title;
+        session.stage = "critique";
+      });
       await harness.tool.execute(
         "tool",
-        { action: "stage_complete" },
+        { action: "checkpoint", handoff: "Keep this global continuity note." },
         undefined,
         undefined,
         ctx,
       );
-      assert.equal(selectedSession(await load(cwd))!.stage, expected);
+      // W4: manual-mode critique requires critiqueSummary; headless (hasUI false) records
+      // it durably and completes.
+      const result = await harness.tool.execute(
+        "tool",
+        {
+          action: "stage_complete",
+          critiqueSummary: "Reviewed plans and handoff; no remaining issues.",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const state = await load(cwd);
+      assert.equal(state.sessions.length, 1);
+      assert.equal(state.sessions[0]!.title, "Second session");
+      const plan = await readPlan(cwd, first.planPath);
+      assert.equal(plan?.status, "complete");
+      assert.equal(plan?.completion?.critique, "manual");
+      const handoff = await readFile(join(cwd, ".kanban", "handoff.md"), "utf8");
+      assert.match(handoff, /Keep this global continuity note/);
+      assert.doesNotMatch(handoff, /Latest completed plan/);
+      assert.match(result.content[0]!.text, /Suggested commit/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
     }
-    await harness.tool.execute(
-      "tool",
-      { action: "stage_complete" },
-      undefined,
-      undefined,
-      ctx,
-    );
-    assert.equal((await load(cwd)).sessions.length, 0);
-    assert.equal((await readPlan(cwd, session.planPath))?.status, "complete");
-  } finally {
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
+  },
+);
+
+test(
+  "manual-mode stage completion advances through the fixed workflow before final archival",
+  async () => {
+    const cwd = await sandbox();
+    try {
+      const harness = extensionHarness();
+      const ctx = context(cwd);
+      const session = (await addSession(cwd, "Stage workflow", "manual")).value;
+      for (const expected of STAGES.slice(1)) {
+        const result = await harness.tool.execute(
+          "tool",
+          { action: "stage_complete" },
+          undefined,
+          undefined,
+          ctx,
+        );
+        assert.equal(selectedSession(await load(cwd))!.stage, expected);
+        // W4: every manual stage_complete result carries the NEXT stage's
+        // single-responsibility prompt (no followUp kickoff message).
+        assert.ok(result.content[0]!.text.length > 40, "transition prompt in result");
+      }
+      // W4: final critique in manual mode requires critiqueSummary (headless completes).
+      await harness.tool.execute(
+        "tool",
+        {
+          action: "stage_complete",
+          critiqueSummary: "Verified the full workflow end to end; no issues.",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal((await load(cwd)).sessions.length, 0);
+      assert.equal((await readPlan(cwd, session.planPath))?.status, "complete");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
 
 test("dashboard renders session status and routes Tab management actions without overlay mode", async () => {
   const cwd = await sandbox();
@@ -282,47 +307,57 @@ test("dashboard renders session status and routes Tab management actions without
   }
 });
 
-test("dashboard Enter selects and opens a clean Pi conversation from the selected plan and global handoff", async () => {
-  const cwd = await sandbox();
-  try {
-    const harness = extensionHarness();
-    await addSession(cwd, "Do not open");
-    const session = (await addSession(cwd, "Recover work")).value;
-    let setupText = "";
-    let kickoff = "";
-    const resumeContext = context(cwd, {
-      hasUI: true,
-      ui: {
-        custom: async (factory: any) => {
-          const component = factory(
-            { requestRender() {} },
-            { fg: (_color: string, text: string) => text, bold: (text: string) => text },
-            { matches: () => false },
-            () => {},
-          );
-          component.handleInput("\r");
-          return { kind: "open", title: session.title };
+test(
+  "/kanban open at implement opens a clean Pi conversation seeded from plan, handoff, and implement kickoff",
+  async () => {
+    const cwd = await sandbox();
+    try {
+      const harness = extensionHarness();
+      await addSession(cwd, "Do not open");
+      const session = (await addSession(cwd, "Recover work", "manual")).value;
+      await writeFile(join(cwd, "init.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      await mutate(cwd, (state) => {
+        const record = state.sessions.find((item) => item.title === session.title)!;
+        record.stage = "implement";
+      });
+      let setupText = "";
+      let kickoff = "";
+      const resumeContext = context(cwd, {
+        hasUI: true,
+        ui: {
+          custom: async (factory: any) => {
+            const component = factory(
+              { requestRender() {} },
+              { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+              { matches: () => false },
+              () => {},
+            );
+            component.handleInput("\r");
+            return { kind: "open", title: session.title };
+          },
         },
-      },
-      newSession: async (options: any) => {
-        await options.setup({
-          appendMessage: (message: any) => (setupText = message.content[0].text),
-        });
-        await options.withSession({
-          sendUserMessage: async (message: string) => (kickoff = message),
-        });
-        return { cancelled: false };
-      },
-    });
-    await harness.commands.get("kanban").handler("", resumeContext);
-    assert.match(setupText, /Global handoff/);
-    assert.match(setupText, /may describe a previously selected session/);
-    assert.match(setupText, /Current session plan \(authoritative\)/);
-    assert.match(kickoff, /run \.\/init\.sh/i);
-  } finally {
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
+        newSession: async (options: any) => {
+          await options.setup({
+            appendMessage: (message: any) => (setupText = message.content[0].text),
+          });
+          await options.withSession({
+            sendUserMessage: async (message: string) => (kickoff = message),
+          });
+          return { cancelled: false };
+        },
+      });
+      await harness.commands.get("kanban").handler("", resumeContext);
+      assert.match(setupText, /Global handoff/);
+      assert.match(setupText, /may describe a previously selected session/);
+      assert.match(setupText, /Current session plan \(authoritative\)/);
+      // W4: the implement kickoff carries the configured init-start command ("auto"
+      // resolves to ./init.sh here) and the detected external-tools line.
+      assert.match(kickoff, /run `?\.\/init\.sh`?/i);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
 
 test("dashboard management and current-session commands rename, pause, unpause, and delete", async () => {
   const cwd = await sandbox();
@@ -387,3 +422,297 @@ test("title creation falls back locally when no model is selected", async () => 
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// W4-dependent expectations (orchestrated pipeline, plan D3/D10). These match
+// the approved plan; they cannot pass until W4 merges the tool/command changes,
+// so they stay skipped (test.skip) to keep the suite green. W4 unskips them.
+// ---------------------------------------------------------------------------
+
+test(
+  "manual-mode stage_complete is accepted with the next-stage prompt in the result and no sendUserMessage",
+  async () => {
+    const cwd = await sandbox();
+    try {
+      const harness = extensionHarness();
+      const ctx = context(cwd);
+      const session = (await addSession(cwd, "Manual flow", "manual")).value;
+      const result = await harness.tool.execute(
+        "tool",
+        { action: "stage_complete" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const state = await load(cwd);
+      assert.equal(selectedSession(state)!.stage, "research");
+      assert.equal(state.sessions.length, 1);
+      // Transition text rides in the tool result (next stage's single-responsibility
+      // prompt) and no followUp kickoff is injected.
+      assert.match(result.content[0]!.text, /research/i);
+      assert.ok(result.content[0]!.text.length > 40);
+      assert.equal(harness.followUps.length, 0);
+      assert.equal(session.title, "Manual flow");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "stage_complete(implement) makes only the single implement→critique transition",
+  async () => {
+    const cwd = await sandbox();
+    try {
+      const harness = extensionHarness();
+      const ctx = context(cwd);
+      const session = (await addSession(cwd, "Implement work", "manual")).value;
+      await mutate(cwd, (state) => {
+        const record = state.sessions.find((item) => item.title === session.title)!;
+        record.stage = "implement";
+      });
+      const result = await harness.tool.execute(
+        "tool",
+        { action: "stage_complete" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const state = await load(cwd);
+      // Exactly one transition: implement → critique, never straight to completion.
+      assert.equal(state.sessions.length, 1);
+      assert.equal(selectedSession(state)!.stage, "critique");
+      assert.match(result.content[0]!.text, /Critique gate armed/i);
+      assert.equal(harness.followUps.length, 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "stage_complete is rejected during pipeline-owned child stages and when blocked",
+  async () => {
+    const cwd = await sandbox();
+    try {
+      const harness = extensionHarness();
+      const ctx = context(cwd);
+      const session = (await addSession(cwd, "Pipeline session", "pipeline")).value;
+      for (const stage of ["refine", "research", "grill", "compose"]) {
+        await mutate(cwd, (state) => {
+          const record = state.sessions.find((item) => item.title === session.title)!;
+          record.stage = stage as any;
+        });
+        const before = selectedSession(await load(cwd))!.stage;
+        let rejected = false;
+        try {
+          const result = await harness.tool.execute(
+            "tool",
+            { action: "stage_complete" },
+            undefined,
+            undefined,
+            ctx,
+          );
+          rejected = /pipeline|resume it/i.test(
+            result.content?.[0]?.text ?? "",
+          );
+        } catch (error) {
+          rejected = /pipeline|resume it/i.test(String(error));
+        }
+        assert.equal(rejected, true, `stage_complete rejected at ${stage}`);
+        assert.equal(selectedSession(await load(cwd))!.stage, before);
+      }
+      // The blocked-state guard: a paused session refuses agent-owned mutations.
+      await mutate(cwd, (state) => {
+        const record = state.sessions.find((item) => item.title === session.title)!;
+        record.state = "blocked";
+      });
+      let blockedRejected = false;
+      try {
+        const result = await harness.tool.execute(
+          "tool",
+          { action: "checkpoint", work: { current: ["nope"] } },
+          undefined,
+          undefined,
+          ctx,
+        );
+        blockedRejected = /paused|blocked/i.test(result.content?.[0]?.text ?? "");
+      } catch (error) {
+        blockedRejected = /paused|blocked/i.test(String(error));
+      }
+      assert.equal(blockedRejected, true, "blocked session refuses checkpoint");
+      assert.equal((await load(cwd)).sessions.length, 1);
+      assert.equal(harness.followUps.length, 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "the enforced critique attempts cap requires rerunCritique or acceptRemainingIssues and refuses early accept",
+  async () => {
+    const cwd = await sandbox();
+    try {
+      const harness = extensionHarness();
+      const ctx = context(cwd);
+      const session = (await addSession(cwd, "Gate cap", "pipeline")).value;
+      const seed = async (extra: Partial<PlanSnapshot>) => {
+        await writePlan(cwd, session.planPath, {
+          ...emptyPlan(session, "Gate cap brief"),
+          ...extra,
+        });
+      };
+      // At the cap (critiqueAttempts >= 2) a plain call must NOT re-run the gate child;
+      // the result states the cap and requires exactly one of rerunCritique /
+      // acceptRemainingIssues, and the session is neither archived nor advanced.
+      await seed({ stage: "critique", critiqueAttempts: 2 });
+      await mutate(cwd, (state) => {
+        const record = state.sessions.find((item) => item.title === session.title)!;
+        record.stage = "critique";
+      });
+      const capped = await harness.tool.execute(
+        "tool",
+        { action: "stage_complete" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.match(capped.content[0]!.text, /rerunCritique|acceptRemainingIssues/i);
+      assert.equal((await load(cwd)).sessions.length, 1);
+      assert.equal(selectedSession(await load(cwd))!.stage, "critique");
+      // Early accept before the cap is refused: "fix or re-run the gate first".
+      await seed({ stage: "critique", critiqueAttempts: 0 });
+      await mutate(cwd, (state) => {
+        const record = state.sessions.find((item) => item.title === session.title)!;
+        record.stage = "critique";
+      });
+      const early = await harness.tool.execute(
+        "tool",
+        { action: "stage_complete", acceptRemainingIssues: true },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.match(early.content[0]!.text, /fix or re-run the gate first/i);
+      assert.equal((await load(cwd)).sessions.length, 1);
+      // rerunCritique and acceptRemainingIssues together are mutually exclusive.
+      const both = await harness.tool.execute(
+        "tool",
+        {
+          action: "stage_complete",
+          rerunCritique: true,
+          acceptRemainingIssues: true,
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.match(both.content[0]!.text, /mutually exclusive/i);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "/kanban complete is gated on plan.pendingCompletion and converts it into the archived completion record",
+  async () => {
+    const cwd = await sandbox();
+    try {
+      const harness = extensionHarness();
+      const ctx = context(cwd);
+      const session = (await addSession(cwd, "Complete gate", "pipeline")).value;
+      await mutate(cwd, (state) => {
+        const record = state.sessions.find((item) => item.title === session.title)!;
+        record.stage = "critique";
+      });
+      // Without pendingCompletion the command only notifies and archives nothing.
+      await harness.commands.get("kanban").handler("complete", ctx);
+      assert.equal((await load(cwd)).sessions.length, 1);
+      // A tool confirm-refusal path wrote the durable pending record; the command is
+      // the only authority and takes no free-form inputs.
+      await writePlan(cwd, session.planPath, {
+        ...emptyPlan(session, "Complete gate brief"),
+        stage: "critique",
+        pendingCompletion: {
+          critique: "accepted-issues",
+          note: "two minor layout issues accepted",
+        },
+      });
+      const confirmCtx = context(cwd, {
+        hasUI: true,
+        ui: { confirm: async () => true },
+      });
+      await harness.commands.get("kanban").handler("complete", confirmCtx);
+      const state = await load(cwd);
+      assert.equal(state.sessions.length, 0);
+      const plan = await readPlan(cwd, session.planPath);
+      assert.equal(plan?.status, "complete");
+      assert.equal(plan?.completion?.critique, "accepted-issues");
+      assert.equal(plan?.pendingCompletion, undefined);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "pipeline-mode critiqueSummary is authorized only while plan.gateFailure exists",
+  async () => {
+    const cwd = await sandbox();
+    try {
+      const harness = extensionHarness();
+      const ctx = context(cwd);
+      const session = (await addSession(cwd, "Gate failure", "pipeline")).value;
+      await mutate(cwd, (state) => {
+        const record = state.sessions.find((item) => item.title === session.title)!;
+        record.stage = "critique";
+      });
+      // A healthy gate cannot be bypassed with a summary: the call is refused (as a
+      // thrown error or an error result) and the session is neither archived nor advanced.
+      await writePlan(cwd, session.planPath, {
+        ...emptyPlan(session, "Gate failure brief"),
+        stage: "critique",
+      });
+      try {
+        await harness.tool.execute(
+          "tool",
+          { action: "stage_complete", critiqueSummary: "sneaky summary" },
+          undefined,
+          undefined,
+          ctx,
+        );
+      } catch {
+        // acceptable refusal shape
+      }
+      assert.equal((await load(cwd)).sessions.length, 1);
+      assert.equal(selectedSession(await load(cwd))!.stage, "critique");
+      // After a durable gateFailure record the manual summary path is the only
+      // completion; headless it completes without any child and records durably.
+      await writePlan(cwd, session.planPath, {
+        ...emptyPlan(session, "Gate failure brief"),
+        stage: "critique",
+        gateFailure: { errorKind: "model", error: "provider auth" },
+      });
+      const result = await harness.tool.execute(
+        "tool",
+        {
+          action: "stage_complete",
+          critiqueSummary: "Reviewed the diff manually; no remaining issues.",
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal((await load(cwd)).sessions.length, 0);
+      const plan = await readPlan(cwd, session.planPath);
+      assert.equal(plan?.status, "complete");
+      assert.equal(plan?.completion?.critique, "manual");
+      assert.ok(result.content[0]!.text.length > 0);
+      assert.equal(harness.followUps.length, 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);

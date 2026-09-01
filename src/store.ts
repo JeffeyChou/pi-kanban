@@ -19,6 +19,7 @@ export const STAGES = [
 ] as const;
 export type Stage = (typeof STAGES)[number];
 export type SessionState = "active" | "blocked";
+export type SessionMode = "pipeline" | "manual";
 export type AgentStatus = "working" | "idle" | "blocked";
 
 export interface AgentRecord {
@@ -31,6 +32,10 @@ export interface Session {
   title: string;
   stage: Stage;
   state: SessionState;
+  /** Missing on legacy sessions; readers treat absence as "manual". */
+  mode?: SessionMode;
+  /** CAS identity of the live pipeline run or armed critique gate; cleared on pause/remove/rename. */
+  pipelineToken?: string;
   planPath: string;
   agents: AgentRecord[];
   createdAt: string;
@@ -139,9 +144,14 @@ function normalizeState(
         (session.state === "active" || session.state === "blocked"),
     )
     .map((session) => {
-      const { piConversationPath: _ignored, ...withoutConversation } = session as V3Session;
+      const {
+        piConversationPath: _ignored,
+        mode: rawMode,
+        ...withoutConversation
+      } = session as V3Session;
       return {
         ...withoutConversation,
+        ...(rawMode === "pipeline" || rawMode === "manual" ? { mode: rawMode } : {}),
         agents: Array.isArray(session.agents)
           ? session.agents.filter(
               (agent): agent is AgentRecord =>

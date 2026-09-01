@@ -15,6 +15,8 @@ Schema version 4 stores only unfinished sessions:
       "title": "Refresh durable persistence",
       "stage": "implement",
       "state": "active",
+      "mode": "pipeline",
+      "pipelineToken": "d3f1a9…",
       "planPath": "plans/2026-08-27-refresh-durable-persistence.json",
       "agents": [
         { "name": "Primary agent", "role": "Coordinator", "status": "idle" },
@@ -29,6 +31,8 @@ Schema version 4 stores only unfinished sessions:
 ```
 
 The only valid session states are `active` and `blocked`; `complete` is intentionally invalid in v4 state. A completed session is represented by its completed plan and the standby handoff, not a historical entry here. Pi conversation paths are intentionally absent: Kanban sessions do not claim, save, or restore Pi chats.
+
+`mode` is optional: `"pipeline"` (new sessions) or `"manual"`; a missing or unknown value means `"manual"` (the legacy safe default). `pipelineToken` is the CAS identity of the live pipeline run or armed critique gate: minted per run, revalidated by every locked pipeline/gate commit, and cleared on pause/remove/rename (which also abort the live run via the title-keyed registry). At most one pipeline runs per process.
 
 Session titles are unique while active. `selectedSessionTitle` must name an element of `sessions` when present. `init.sh --check` validates these rules.
 
@@ -64,7 +68,28 @@ The date is the local creation date. `safe-title` is a lowercase ASCII slug, wit
 }
 ```
 
-Plans must not contain UUIDs, task/todo IDs, evidence arrays, review records, source-file fields, or a copy of Pi context usage. A plan is a compact decision aid, not an event log.
+Plans must not contain UUIDs, task/todo IDs, evidence arrays, review records, source-file fields, or a copy of Pi context usage. A plan is a compact decision aid, not an event log. The single exception is the bounded archive-time `completion` record described below: plans never accumulate progressive review/evidence archives — the transient per-stage sections live in the workfile instead.
+
+In addition to the fields above, a plan may carry these optional additive fields (pipeline/gate control data, never task/todo detail):
+
+- `complexity` — the refine stage's `simple`/`standard` verdict (drives the fast path).
+- `critiqueAttempts` — gate runs so far; enforces the critique attempts cap.
+- `pendingCompletion` — `{ critique: "accepted-issues" | "manual"; note: string }`; written by a tool confirm-refusal/timeout path with a bounded note, and the only authority (consumed by `/kanban complete`) for the escape-hatch archive. Cleared by a later gate PASS or an explicit `rerunCritique`.
+- `gateFailure` — `{ errorKind: "spawn" | "model" | "other"; error?: string }`; written when a critique-gate child fails, and the only thing that authorizes the pipeline-mode `critiqueSummary` path. Cleared by a successful gate run.
+- `completion` — `{ critique: "pass" | "accepted-issues" | "manual" | "skipped"; note?: string }`; written exactly once at archive time, note bounded to 10 lines. **This bounded archive-time completion record is the ONE sanctioned exception to the no-review-records invariant**: it is the durable trail because the workfile is deleted at completion. `critique: "skipped"` records the `critique: false` config path.
+
+Plans stay compact otherwise: UUIDs, task/todo IDs, evidence arrays, review records, and source-file lists never return.
+
+## `work/<base>.md`: the workfile
+
+The workfile is the pipeline's transient per-stage output artifact, one file per session under `.kanban/work/`, named by plan basename (`plans/2026-09-01-title.json` → `2026-09-01-title.md`). It is a separate artifact class; plans keep their compact contract untouched.
+
+- **Sole writer**: the orchestrator (child stages) or the critique tool, always inside the same locked commit that advances the stage. Section bodies never include the `## <stage>` heading — the writer owns those heading lines and a read returns bodies without them.
+- **Sections**: one `## <stage>` section per stage, each capped at 300 lines at write time (truncated with a note); writes atomically replace one section and preserve the others.
+- **Resume authority is `state.json`'s stage ONLY**: sections are prompt inputs. `/kanban open` on a child-run stage re-runs the CURRENT stage (a stale section for it is overwritten). At implement/critique it opens the conversation; a missing workfile there is tolerated — the seed notes "spec unavailable" and the agent proceeds from the plan JSON.
+- **Lifecycle**: created on the first section write; deleted at final completion and at `/kanban remove`; never created by migration; orphans (base matching no session in ANY state, active or blocked) are swept at startup — a paused session keeps its workfile.
+
+The workfile is not a review archive: the critique FAIL body lands in `## critique` to explain the current issues, and completion is recorded durably in the plan's bounded `completion` field.
 
 ## `handoff.md`: supplemental continuation data
 

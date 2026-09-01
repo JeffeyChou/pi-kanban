@@ -18,13 +18,7 @@ Restart Pi after installation, or use `/reload` after editing the package. Start
 /kanban create refresh persistence and improve the session UI
 ```
 
-The prompt is the session brief. Kanban asks the current authenticated Pi model for a short title, then falls back to a safe local prompt summary if title generation is unavailable. It creates and selects the session, creates its plan, and begins `refine`.
-
-Before implementation, the kickoff requires the agent to run:
-
-```sh
-./init.sh
-```
+The prompt is the session brief. Kanban asks the current authenticated Pi model for a short title, then falls back to a safe local prompt summary if title generation is unavailable. It creates and selects a pipeline-mode session, runs the pipeline, and notifies when the spec is composed.
 
 The staged workflow is fixed:
 
@@ -32,18 +26,42 @@ The staged workflow is fixed:
 refine → research → grill → compose → implement → critique
 ```
 
-Only `kanban_update` with `stage_complete` advances a stage. A final `critique` completion archives the plan and removes the completed session from `state.json`.
+Refine, research, grill, and compose run in Kanban's own internal child sessions, one output section per stage (`.kanban/work/<base>.md`). The pipeline never switches your conversation: after compose it stops and tells you to run `/kanban open` (or press Enter on the session in `/kanban`) to start implementation in a fresh Pi conversation. If child sessions fail (no runner, model/auth problem), the session durably falls back to manual mode: you run every stage yourself in the main conversation.
+
+If the repository has an executable `./init.sh`, the implement kickoff, final completion text, and handoff rules carry the auto-detected init commands (`init: { start: "auto", check: "auto" }` in config; set `null` to disable). Stage prompts and tool guidance never mention init commands.
 
 ## Commands
 
 | Command | Behavior |
 | --- | --- |
-| `/kanban` | Opens the keyboard-driven Kanban dashboard. ↑/↓ or `j`/`k` previews a session's status; Enter selects it and opens a clean Pi conversation; Tab opens management mode, where Enter opens, `r` renames, and `x` permanently deletes after confirmation. Rename/delete return to the refreshed dashboard; only opening a session leaves it. |
-| `/kanban create <prompt>` | Generates a title, creates/selects the durable session, then opens a clean Pi conversation seeded with the plan and global handoff. |
-| `/kanban pause` / `/kanban unpause` | Marks the currently selected session `blocked` or `active` without changing its stage. |
-| `/kanban remove` | Permanently deletes the currently selected session and its plan after confirmation. |
+| `/kanban` | Opens the keyboard-driven Kanban dashboard. ↑/↓ or `j`/`k` previews a session's status; Enter selects a session and routes to `/kanban open`; Tab opens management mode, where Enter opens, `r` renames, and `x` permanently deletes after confirmation. Rename/delete return to the refreshed dashboard; only opening a session leaves it. |
+| `/kanban create <prompt>` | Generates a title, creates/selects the durable pipeline-mode session, and starts the pipeline. |
+| `/kanban open [title]` | No title means the selected session. At implement/critique it opens a clean Pi conversation seeded with plan, handoff, and workfile spec; on a pipeline-owned stage it re-runs that stage's child (blocked sessions are refused with a notify). Also aborts any live pipeline run for that title before minting a fresh token. |
+| `/kanban config` | Opens `.kanban/config.json` in the editor (created if missing). |
+| `/kanban pause` / `/kanban unpause` | Marks the currently selected session `blocked` or `active` without changing its stage. Pausing also aborts a live pipeline run and clears its token; unpausing restarts nothing. |
+| `/kanban remove` | Permanently deletes the currently selected session, its plan, and its workfile after confirmation (a live run is aborted first). |
+| `/kanban complete` | Escape hatch for the critique step: valid only while the plan carries a `pendingCompletion` record (a tool confirm path directed the session there). Confirms with the user, then archives like a normal critique completion. |
 
 The dashboard is rendered as a bordered editor-area panel, not a floating transcript overlay. Escape closes it. It never exposes internal identifiers because active sessions are selected by title.
+
+## Configuration
+
+`.kanban/config.json` (created by `/kanban config`) overrides the global `~/.pi/agent/extensions/kanban.json`; defaults apply before both. Unknown keys warn and are ignored.
+
+```jsonc
+{
+  "models": { "refine": null, "research": null, "grill": null, "compose": null,
+              "critique": null },          // "provider:model-id" or null → parent model
+  "research": { "workers": 3 },           // 1–3 parallel research workers
+  "fastPath": true,                        // refine "simple" verdict skips research + grill
+  "critique": true,                        // false ⇒ critique completes without a gate
+  "runner": "auto",                       // auto | inprocess | subprocess
+  "piBin": "pi",                          // subprocess backend binary (PATH lookup)
+  "init": { "start": "auto", "check": "auto" }  // auto: ./init.sh iff executable; string; null
+}
+```
+
+Each stage (and research worker) uses its configured model when set; otherwise the parent session model. Installed external subagent/background-task tools are detected and named in the implement kickoff — they are never invoked by Kanban.
 
 ## Low-noise checkpoints
 
@@ -52,11 +70,11 @@ The dashboard is rendered as a bordered editor-area panel, not a floating transc
 | Action | Use |
 | --- | --- |
 | `checkpoint` | Record one material update to scope, agent roster, compact work summary, or handoff. |
-| `stage_complete` | Record an optional checkpoint and explicitly move to the next stage, or complete the final stage. |
+| `stage_complete` | Record an optional checkpoint and explicitly move to the next stage, or complete the final stage. In critique it accepts the gate parameters `rerunCritique`, `acceptRemainingIssues`, and `critiqueSummary`. |
 
 A checkpoint may supply `inScope`, `outOfScope`, a complete `agents` roster (`name`, `role`, `status`), `work` (`done`, `current`, `next`), and a replacement `handoff` supplement. Use it at stage boundaries or when the plan materially changes—not after each tool call or todo.
 
-Kanban records externally scheduled agents but does not itself launch Pi background tasks or subagents. The widget derives the primary agent's live state from Pi and combines it with checkpointed external-agent statuses.
+Stage transitions ride in the tool result text; no followUp kickoff message is injected. Pipeline-owned stages reject `stage_complete` until implementation opens in your conversation. The critique gate (PASS/FAIL bullets, enforced attempts cap, `acceptRemainingIssues` with human confirm when a UI is present, `/kanban complete` escape hatch) is described in [docs/agent-workflow.md](docs/agent-workflow.md).
 
 ## Selected-session widget
 
@@ -75,8 +93,10 @@ Context capacity comes directly from Pi's active model and context-usage APIs. T
 
 `.kanban/` stays untracked and contains:
 
-- `state.json` — schema v4 canonical core state: selected unfinished session, stage, agent names/roles/statuses, and timestamps. It never stores Pi conversation paths.
-- `plans/YYYY-MM-DD-safe-title.json` — compact, reviewable session detail: prompt, scope boundaries, agents, work summary, status, and timestamps. Completed session plans remain here.
+- `state.json` — schema v4 canonical core state: selected unfinished session, stage, `mode`, agent names/roles/statuses, and timestamps. It never stores Pi conversation paths.
+- `plans/YYYY-MM-DD-safe-title.json` — compact, reviewable session detail: prompt, scope boundaries, agents, work summary, status, and timestamps. Completed session plans remain here; the only review data a plan carries is the bounded archive-time `completion` record.
+- `work/<base>.md` — the workfile: one `## <stage>` section per pipeline stage (each capped at 300 lines), written only by the orchestrator/critique tool inside the locked commit; resume authority is `state.json`'s stage only. Deleted at completion and `/kanban remove`; orphans are swept at startup.
+- `config.json` — repository config override (see above).
 - `handoff.md` — one handoff, capped at 200 lines. Its fixed rules are followed by supplemental decisions, blockers, next steps, and verification notes; it does not restate state fields.
 - `lock/` — cooperative mutation lock.
 
@@ -113,7 +133,10 @@ For agent-facing reference material, use:
 
 ## Current limitations
 
-- Kanban records externally orchestrated agents but does not launch, cancel, or monitor Pi subagents/background tasks itself.
+- Pipeline child sessions are Kanban-internal; third-party subagent/background-task tools are only detected and named in the implement kickoff, never launched.
+- Child sessions (both runner backends) build models/auth from `~/.pi/agent` files; providers registered dynamically via `pi.registerProvider` may not work in children (L1). A child model failure falls back per-stage: refine/grill/compose failure (or no runner, or ALL research workers failing) durably flips the session to manual mode with a notify; a critique-gate child failure records `plan.gateFailure` and offers the manual summary path. Partial research-worker failures are noted and the pipeline continues with the workers that succeeded.
+- Pausing from another process takes effect at stage boundaries, not mid-child: the orchestrator reloads state between stages.
+- One live pipeline run per process; starting a second under a different title is refused until the first is paused or finishes.
 - Session selection is repository-wide; do not use multiple active Pi conversations against the same board concurrently.
 - The cooperative lock has no stale-lock owner-liveness recovery.
 - Kanban cannot prevent Pi itself from opening or continuing a native Pi conversation; it simply does not bind that conversation to a Kanban session. The context widget reports the conversation Pi currently has open.

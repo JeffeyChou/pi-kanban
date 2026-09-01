@@ -30,8 +30,11 @@ if (!session) {
   console.log("Kanban: no active session.");
 } else {
   console.log(`Kanban: ${session.title}`);
-  console.log(`Stage: ${session.stage} · ${session.state}`);
+  console.log(`Stage: ${session.stage} · ${session.state}${session.mode ? ` · ${session.mode} mode` : ""}`);
   console.log(`Plan: .kanban/${session.planPath}`);
+  const base = session.planPath.replace(/^plans\//, "").replace(/\.json$/, "");
+  const workfile = `.kanban/work/${base}.md`;
+  if (existsSync(workfile)) console.log(`Workfile: ${workfile}`);
   console.log(`Agents: ${session.agents?.map((agent) => `${agent.name} (${agent.role}, ${agent.status})`).join(", ") || "none"}`);
 }
 '
