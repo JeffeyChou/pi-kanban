@@ -61,13 +61,28 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 
 function config(overrides: Partial<KanbanConfig> = {}): KanbanConfig {
   return {
-    models: { refine: null, research: null, grill: null, compose: null, critique: null },
+    models: {
+      refine: null,
+      research: null,
+      grill: null,
+      compose: null,
+      implement: null,
+      critique: null,
+    },
     research: { workers: 3 },
     fastPath: true,
     critique: true,
     runner: "auto",
     piBin: "pi",
     init: {},
+    loop: {
+      enabled: false,
+      direction: "higher",
+      maxIterations: 10,
+      noImprovementStreak: 3,
+      measureTimeoutMs: 300_000,
+      hooks: false,
+    },
     ...overrides,
   };
 }
@@ -477,7 +492,14 @@ test("a refine child failure flips to manual mode and stops the pipeline", async
 
 test("an unresolvable configured model fails the stage instead of running a child", async () => {
   const kanban = await harness({
-    config: { models: { refine: "missing:model", research: null, grill: null, compose: null, critique: null } },
+    config: { models: {
+        refine: "missing:model",
+        research: null,
+        grill: null,
+        compose: null,
+        implement: null,
+        critique: null,
+      } },
   });
   try {
     await kanban.run();
@@ -845,7 +867,14 @@ test("runCritiqueGate reports a child failure without a verdict", async () => {
 test("runCritiqueGate fails without running a child when models.critique cannot resolve", async () => {
   const kanban = await gateHarness({
     config: {
-      models: { refine: null, research: null, grill: null, compose: null, critique: "missing:model" },
+      models: {
+        refine: null,
+        research: null,
+        grill: null,
+        compose: null,
+        implement: null,
+        critique: "missing:model",
+      },
     },
   });
   try {

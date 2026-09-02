@@ -13,19 +13,24 @@ Develop `kanban`, a local Pi extension for durable, low-noise Kanban sessions. T
 
 ## Repository map
 
-- `src/index.ts` – Pi commands (`/kanban`, create, `/kanban open`, `/kanban config`, `/kanban complete`), the `kanban_update` tool and critique gate, lifecycle hooks, resume, and title generation.
+- `src/index.ts` – Pi commands (`/kanban`, create, `/kanban open`, `/kanban implement`, `/kanban config`, `/kanban complete`), the `kanban_update` tool and critique gate, lifecycle hooks, resume, and title generation.
 - `src/store.ts` – compact v4 state, migrations, lock, mutations, selection, agents, session modes, and stage progression.
 - `src/artifacts.ts` – compact plan snapshots (including the bounded archive-time completion record) and the one bounded handoff.
-- `src/orchestrator.ts` – the internal pipeline engine: child-session runs, research fan-out, grill Q&A, the title-keyed abort registry, and the model-resolving critique-gate seam.
+- `src/orchestrator.ts` – the internal pipeline engine: child-session runs, research fan-out, grill Q&A, the title-keyed abort registry, the model-resolving critique-gate seam, and the implement-loop run handle (run identity, locked commits, child plumbing).
+- `src/implementloop.ts` – the orchestrator-owned implement experiment loop: per-iteration worktrees, fitness decision, lessons, termination, and detect-and-defer landing.
+- `src/worktree.ts` – plain-git worktree and patch primitives (`git apply` without `--index`; never `git add`/`git commit`).
+- `src/measure.ts` – runs the opt-in `loop.validate`/`loop.metric` commands in their own process group and parses `METRIC <name>=<value>`.
+- `src/looplog.ts` – `.kanban/loop/<base>.*` breadcrumbs, the living lesson summary, and the owner-PID worktree manifest.
 - `src/runner.ts` – in-process and subprocess child-session backends (frozen `RunChild` seam).
 - `src/prompts.ts` – per-stage prompts, output grammar, implement kickoff, and completion text (frozen).
-- `src/config.ts` – merged global + repository config: per-stage models, research workers, fastPath, runner backend, and auto-detected init commands.
+- `src/config.ts` – merged global + repository config: per-stage models (including `implement`), research workers, fastPath, runner backend, auto-detected init commands, and the opt-in `loop` block.
 - `src/capabilities.ts` – detection of installed external subagent/background-task tools for the implement kickoff.
 - `src/workfile.ts` – the `.kanban/work/<base>.md` section artifact.
 - `src/ui.ts` – themed selected-session widget and keyboard title picker.
 - `init.sh` – start report and completion checks.
 - `test/store.test.ts` – state, migration, lock, plan, and handoff tests.
-- `test/extension.integration.test.ts` – command, checkpoint, UI, resume, pipeline-mode, and critique-gate tests.
+- `test/extension.integration.test.ts` – command, checkpoint, UI, resume, pipeline-mode, critique-gate, and `/kanban implement` tests.
+- `test/implementloop.test.ts` – the implement loop end to end against real git worktrees.
 
 ## Core invariants
 
@@ -38,8 +43,11 @@ Develop `kanban`, a local Pi extension for durable, low-noise Kanban sessions. T
 - Obtain context capacity from Pi's model/context APIs; never require a user-maintained model limit or render `unavailable`.
 - Stage order is `refine → research → grill → compose → implement → critique`. Only an explicit `kanban_update` `stage_complete` (implement/critique) or an orchestrator locked commit (pipeline child stages, one stage per commit) advances a stage; never advance implicitly.
 - `kanban_update` is a low-frequency selected-session checkpoint: do not restore task/todo-level actions or identifier parameters.
-- Kanban runs its own internal child sessions for the pipeline stages: refine, research, grill, and compose are orchestrator-owned child sessions; implement and critique are agent-owned in the main conversation. External scheduling tools remain external: Kanban only names installed subagent/background-task tools in the implement kickoff and never launches them.
-- Every session carries an optional `mode` (`"pipeline"` | `"manual"`; missing ⇒ `"manual"`) and a `pipelineToken` CAS identity for the live pipeline run or armed critique gate, minted per run and cleared on pause/remove/rename. One pipeline runs per process; a second is refused.
+- Kanban runs its own internal child sessions for the pipeline stages: refine, research, grill, and compose are orchestrator-owned child sessions; critique is agent-owned in the main conversation. Implement ownership is SPLIT by config: with `config.loop.enabled` it is ORCHESTRATOR-owned (the implement loop, whose locked commit advances implement→critique after landing), and with the default `loop.enabled: false` it is AGENT-owned in the main conversation exactly as before. External scheduling tools remain external: Kanban only names installed subagent/background-task tools in the implement kickoff and never launches them.
+- The implement loop is COMMIT-FREE and STAGE-FREE. Its best-so-far result is a patch (`git diff --binary` for tracked changes plus a synthesized new-file patch per untracked path), each iteration runs in a detached `git worktree` under gitignored `.kanban/worktrees/`, and the winner lands with `git apply --binary` WITHOUT `--index` — uncommitted and unstaged. No code path in `src/worktree.ts`, `src/implementloop.ts`, or anywhere else may run `git add`, `git commit`, or pass `--index`/`--cached` to `git apply`. Iteration children get `read/grep/find/ls/edit/write` and deliberately NO `bash`, so a child cannot run git or leave its worktree by `cd`; the worktree is cooperative experiment isolation, not a filesystem sandbox.
+- `loop.validate` and `loop.metric` are the only commands Kanban executes from its own config, plus the `.kanban/hooks/{before,after}-iteration` scripts when `loop.hooks` is enabled. All of them are explicit and opt-in, run only inside an iteration worktree, and are NEVER aliased from `config.init.*`. Loop progress is reported through `ctx.ui.setStatus`, never as a fifth widget row.
+- `stage_complete(implement)` is refused only while a LIVE in-memory run exists for the title; a stale durable `pipelineToken` (left by the compose pipeline or a crash) must never block a manual implement advance.
+- Every session carries an optional `mode` (`"pipeline"` | `"manual"`; missing ⇒ `"manual"`) and a `pipelineToken` CAS identity for the live pipeline run or armed critique gate, minted per run and cleared on pause/remove/rename. The implement loop reuses the same two fields — it adds NO Session field, and every breadcrumb it keeps lives in `.kanban/`. One pipeline or implement loop runs per process; a second is refused.
 - `.kanban/work/<base>.md` is the workfile: the orchestrator or critique tool is its sole writer, always inside the locked commit; one `## <stage>` section per stage, each capped at 300 lines; resume authority is `state.json`'s stage only (sections are prompt inputs); it is deleted at final completion and `/kanban remove`; orphans are swept at startup.
 - Init commands come from config (auto-detected executable `./init.sh`) and are never hardcoded; they appear only in the implement kickoff, the final completion text, and the handoff's operating-rules header (rendered only when configured) — never in stage prompts or tool guidance.
 - Stage-transition instructions ride in `kanban_update` tool results; there is no `sendUserMessage(…, followUp)` kickoff injection.
@@ -54,7 +62,8 @@ Develop `kanban`, a local Pi extension for durable, low-noise Kanban sessions. T
 - Preserve rehydration on `session_start`, durable handoffs across Pi conversations, and legacy v1/v2 migration.
 - Lifecycle refreshes must not write state on every tool execution.
 - Document behavior and limitations accurately; do not promise orchestration the code does not perform.
-- Update tests with behavior changes, especially migration, locking, stages, session modes, pipeline tokens, resume, selection, checkpoint payloads, gate records, workfile lifecycle, handoff bounds, and init checks.
+- Update tests with behavior changes, especially migration, locking, stages, session modes, pipeline tokens, resume, selection, checkpoint payloads, gate records, workfile lifecycle, handoff bounds, init checks, and the implement loop's fitness/landing/recovery behavior.
+- The implement loop's design record is `docs/plans/loop-driver-v2.md`; read it before changing fitness, patch capture, landing, or worktree lifecycle.
 - Keep `README.md` and `docs/development.md` consistent with implementation.
 
 ## Validation

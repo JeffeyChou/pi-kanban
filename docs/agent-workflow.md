@@ -24,7 +24,7 @@ Do not ask the user to supply a separate title unless title generation or local 
 
 ### Pipeline mode vs manual mode
 
-New sessions are `pipeline` mode: refine, research, grill, and compose run in orchestrator-owned child sessions before your conversation starts, and the pipeline notifies when compose is done. You then enter at implement via user-initiated `/kanban open` (or dashboard Enter) — the pipeline never switches conversations itself. In pipeline mode you own only implement and critique via `kanban_update`; `stage_complete` during a pipeline-owned child stage is rejected and tells you to use `/kanban open`.
+New sessions are `pipeline` mode: refine, research, grill, and compose run in orchestrator-owned child sessions before your conversation starts, and the pipeline notifies when compose is done. You then enter at implement via user-initiated `/kanban open` (or dashboard Enter) — the pipeline never switches conversations itself. In pipeline mode you own only implement and critique via `kanban_update`; `stage_complete` during a pipeline-owned child stage is rejected and tells you to use `/kanban open`. With `config.loop.enabled`, implement can instead be run by the orchestrator's implement loop (`/kanban implement`); while that loop is live, `stage_complete(implement)` is refused and `/kanban implement stop` ends it. When the loop ends EXHAUSTED it has landed its partial best in your working tree and left the stage at implement: review it, finish the work yourself via `/kanban open`, and complete the stage normally.
 
 Sessions fall back to durable `manual` mode (locked, revalidated, notified) when the runner backend is unavailable, a refine/grill/compose child fails, or ALL research workers fail. In manual mode every stage is agent-owned again: each `stage_complete` result carries the next stage's single-responsibility prompt, and entering implement always delivers the implement kickoff (configured init-start plus detected external tools). Manual mode is durable for the session; only a fresh pipeline-mode run mints a new pipeline token.
 
@@ -80,7 +80,7 @@ Stages are a communication and review structure. In pipeline mode, stages `refin
 | `research` | pipeline (N parallel child workers) | Verify repository facts, relevant APIs, and external constraints; one angle per worker. |
 | `grill` | pipeline child + orchestrator Q&A | Challenge assumptions, failure modes, compatibility, and safety; open questions answered or assumed. |
 | `compose` | pipeline child | Produce a decision-complete implementation spec (`## compose`). |
-| `implement` | main conversation | Execute the spec and validate the agreed change; the workfile spec and plan are the authority. |
+| `implement` | main conversation, or the loop when `config.loop.enabled` | Execute the spec and validate the agreed change; the workfile spec and plan are the authority. With the loop enabled, `/kanban implement` runs the stage as orchestrator-owned iterations in disposable git worktrees and lands the winner as uncommitted, unstaged changes. |
 | `critique` | main conversation + gate child | Independently inspect the result and final validation evidence against the spec; see the critique gate below. |
 
 Only use `stage_complete` after the current outcome is actually met. Kanban does not independently prove that tests passed, required reviews happened, or external agents finished; that remains the active agent's responsibility.

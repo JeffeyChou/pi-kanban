@@ -14,6 +14,12 @@ import {
   selectedSession,
 } from "../src/store.js";
 import { renderSelected, showDashboard } from "../src/ui.js";
+import { loadConfig } from "../src/config.js";
+import {
+  clearPipelineRegistry,
+  hasLiveRun,
+  runCritiqueGate,
+} from "../src/orchestrator.js";
 
 async function sandbox() {
   return mkdtemp(join(tmpdir(), "kanban-extension-test-"));
@@ -712,6 +718,133 @@ test(
       assert.ok(result.content[0]!.text.length > 0);
       assert.equal(harness.followUps.length, 0);
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "/kanban implement falls back to the agent-owned conversation while the loop is disabled",
+  async () => {
+    const cwd = await sandbox();
+    try {
+      const harness = extensionHarness();
+      const session = (await addSession(cwd, "Loop off", "pipeline")).value;
+      await mutate(cwd, (state) => {
+        const record = state.sessions.find((item) => item.title === session.title)!;
+        record.stage = "implement";
+      });
+      let kickoff = "";
+      const ctx = context(cwd, {
+        newSession: async (options: any) => {
+          await options.setup({ appendMessage: () => {} });
+          await options.withSession({
+            sendUserMessage: async (message: string) => (kickoff = message),
+          });
+          return { cancelled: false };
+        },
+      });
+      await harness.commands.get("kanban").handler("implement", ctx);
+      // loop.enabled defaults to false: implement stays AGENT-owned, exactly as today.
+      assert.match(kickoff, /implement/i);
+      assert.equal((await load(cwd)).sessions[0]!.stage, "implement");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test("/kanban implement refuses an enabled loop with no fitness signal", async () => {
+  const cwd = await sandbox();
+  try {
+    const harness = extensionHarness();
+    const session = (await addSession(cwd, "Loop unarmed", "pipeline")).value;
+    await mutate(cwd, (state) => {
+      const record = state.sessions.find((item) => item.title === session.title)!;
+      record.stage = "implement";
+    });
+    await writeFile(
+      join(cwd, ".kanban", "config.json"),
+      JSON.stringify({ loop: { enabled: true } }),
+      "utf8",
+    );
+    const ctx = context(cwd);
+    await harness.commands.get("kanban").handler("implement", ctx);
+    assert.match(ctx.notifications.join("\n"), /fitness signal/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("/kanban implement is only valid at the implement stage and reports a wrong verb", async () => {
+  const cwd = await sandbox();
+  try {
+    const harness = extensionHarness();
+    await addSession(cwd, "Not implementing", "pipeline");
+    const ctx = context(cwd);
+    await harness.commands.get("kanban").handler("implement", ctx);
+    assert.match(ctx.notifications.join("\n"), /only valid at the implement stage/);
+    await harness.commands.get("kanban").handler("implement nonsense", ctx);
+    assert.match(ctx.notifications.join("\n"), /Usage: \/kanban implement \[stop\]/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test(
+  "stage_complete(implement) is refused only while a run is LIVE, never for a stale token",
+  async () => {
+    const cwd = await sandbox();
+    try {
+      const harness = extensionHarness();
+      const ctx = context(cwd);
+      const session = (await addSession(cwd, "Loop live", "pipeline")).value;
+      await mutate(cwd, (state) => {
+        const record = state.sessions.find((item) => item.title === session.title)!;
+        record.stage = "implement";
+        // A DURABLE token with no live run: left behind by the compose pipeline or a crash.
+        record.pipelineToken = "stale-token";
+      });
+
+      // A stale token alone must NOT block the agent-owned advance.
+      const advanced = await harness.tool.execute(
+        "tool",
+        { action: "stage_complete" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.match(advanced.content[0]!.text, /Critique gate armed/i);
+      assert.equal(selectedSession(await load(cwd))!.stage, "critique");
+
+      // With a LIVE registry entry for the title, the same call is refused.
+      await mutate(cwd, (state) => {
+        const record = state.sessions.find((item) => item.title === session.title)!;
+        record.stage = "implement";
+      });
+      const controller = new AbortController();
+      const gate = runCritiqueGate(ctx as any, selectedSession(await load(cwd))!, {
+        runChild: () =>
+          new Promise((resolve) => {
+            controller.signal.addEventListener("abort", () =>
+              resolve({ text: "", aborted: true, errorKind: "aborted" }),
+            );
+          }),
+        config: (await loadConfig(cwd)).config,
+        diff: "",
+        signal: controller.signal,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(hasLiveRun(session.title), true);
+      await assert.rejects(
+        harness.tool.execute("tool", { action: "stage_complete" }, undefined, undefined, ctx),
+        /implement loop is running/,
+      );
+      controller.abort();
+      await gate;
+      assert.equal(hasLiveRun(session.title), false);
+    } finally {
+      clearPipelineRegistry();
       await rm(cwd, { recursive: true, force: true });
     }
   },

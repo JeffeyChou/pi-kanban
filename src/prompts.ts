@@ -316,3 +316,139 @@ export function completionText(config: KanbanConfig, plan: PlanSnapshot): string
   );
   return lines.join("\n");
 }
+
+/* ------------------------------------------------------------------------------------------ *
+ * The implement-experiment loop (plan v2.5). One prompt per iteration; the `Status:` verdict
+ * GATES the advance, so the grammar is as load-bearing as the critique gate's `Gate:` line.
+ * ------------------------------------------------------------------------------------------ */
+
+export interface ImplementLoopInputs {
+  title: string;
+  /** Original session prompt (plan.prompt). */
+  prompt: string;
+  /** The recorded `## compose` section — the spec being implemented. */
+  spec?: string;
+  /** The bounded living summary of earlier iterations (`.kanban/loop/<base>.md`). */
+  lessons?: string;
+  iteration: number;
+  maxIterations: number;
+  /** The fitness signals, described (never executed) for the child. */
+  validate?: string;
+  /** True when `loop.metric` is configured; `direction` alone always has a default. */
+  hasMetric?: boolean;
+  metricName?: string;
+  direction?: "higher" | "lower";
+  target?: number;
+  /** Best metric so far, for context. */
+  bestMetric?: number;
+  /** Bounded stdout of an opt-in before-iteration hook. */
+  hookNote?: string;
+}
+
+export interface ImplementLoopVerdict {
+  /** `complete` gates SUCCESS; anything unparseable is `continue` (never a false success). */
+  verdict: "complete" | "continue";
+  /** One-line self-report recorded with the iteration. */
+  rationale?: string;
+}
+
+function fitnessLines(inputs: ImplementLoopInputs): string[] {
+  const lines: string[] = ["", "## How your work is judged", ""];
+  if (inputs.validate)
+    lines.push(
+      `- Kanban runs \`${inputs.validate}\` in this worktree after you stop. A non-zero exit discards everything you did in this iteration.`,
+    );
+  else
+    lines.push(
+      "- No validation command is configured, so the metric below is the only fitness signal.",
+    );
+  if (inputs.hasMetric) {
+    const goal =
+      inputs.direction === "lower" ? "strictly lower" : "strictly higher";
+    lines.push(
+      `- A metric${inputs.metricName ? ` (\`${inputs.metricName}\`)` : ""} is also measured, and your work is kept only when it is ${goal} than the best so far${inputs.bestMetric === undefined ? "" : ` (${inputs.bestMetric})`}${inputs.target === undefined ? "" : `; the target is ${inputs.target}`}.`,
+    );
+  }
+  lines.push(
+    "- A discarded iteration is reverted completely, and only the lesson survives. A kept iteration becomes the base the next iteration builds on.",
+  );
+  return lines;
+}
+
+/** The per-iteration implement prompt: spec + injected lessons + the smallest-change rule. */
+export function implementLoopPrompt(inputs: ImplementLoopInputs): string {
+  const lines: string[] = [
+    `# Kanban implement stage — iteration ${inputs.iteration} of ${inputs.maxIterations} — “${inputs.title}”`,
+    "",
+    "You are executing the implement stage of the Kanban workflow as ONE experiment in an iterative loop.",
+    "Your working directory is a private, disposable git worktree. Nothing you write reaches the user's checkout unless Kanban measures this iteration as an improvement and lands it.",
+    "",
+    "## Original request",
+    "",
+    inputs.prompt.trim() || inputs.title,
+  ];
+  if (inputs.spec?.trim())
+    lines.push("", "## The recorded spec — implement exactly this", "", inputs.spec.trim());
+  else
+    lines.push(
+      "",
+      "## The recorded spec",
+      "",
+      "No compose section was recorded. Implement the original request directly, and keep the change minimal.",
+    );
+  if (inputs.lessons?.trim())
+    lines.push(
+      "",
+      "## What earlier iterations already learned — do not repeat a failed hypothesis",
+      "",
+      inputs.lessons.trim(),
+    );
+  if (inputs.hookNote?.trim())
+    lines.push("", "## Repository note for this iteration", "", inputs.hookNote.trim());
+  lines.push(...fitnessLines(inputs));
+  lines.push(
+    "",
+    "## Working rules",
+    "",
+    "- Make the SMALLEST change that advances the spec. One coherent step per iteration; the loop runs again after this one.",
+    "- Read before you write: this worktree already contains any change earlier iterations got kept.",
+    "- You can read, search, edit and write files. You have NO shell: you cannot run commands, tests, or git. Kanban runs the validation for you, so do not ask for it and do not fake evidence of it.",
+    "- Stay inside this worktree. Never edit an absolute path outside it and never reach upwards with `../`.",
+    "- Follow the repository's own conventions and its AGENTS.md; never stage or commit anything.",
+    "",
+    "## Required output",
+    "",
+    "End your reply with exactly these two lines:",
+    "",
+    "`Status: complete` when the recorded spec is now FULLY implemented and you would hand it to review, or `Status: continue` when more iterations are needed.",
+    "`Rationale: <one line>` — what you changed this iteration and why.",
+    "",
+    "`Status: complete` is a claim Kanban acts on: it ends the loop and advances the session to critique. Only write it when the spec is genuinely finished.",
+  );
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Last `Status:` line wins; anything unparseable is `continue`.
+ *
+ * The value must be EXACTLY `complete` or `continue` (markdown emphasis and trailing
+ * punctuation aside). A prefix match would score a line that merely ECHOES the required
+ * grammar — `- Status: complete when the spec is met` — as a real verdict, and since this
+ * verdict gates the stage advance, leniency here buys a false advance.
+ */
+export function parseImplementLoopOutput(text: string): ImplementLoopVerdict {
+  let verdict: "complete" | "continue" = "continue";
+  let rationale: string | undefined;
+  for (const line of (text ?? "").split(/\r?\n/)) {
+    const status = labelled(line, "Status");
+    if (status !== undefined) {
+      const value = status.replace(/[`*_]/g, "").replace(/[.!;,]+$/, "").trim().toLowerCase();
+      if (value === "complete") verdict = "complete";
+      else if (value === "continue") verdict = "continue";
+      continue;
+    }
+    const reason = labelled(line, "Rationale");
+    if (reason) rationale = reason;
+  }
+  return { verdict, ...(rationale ? { rationale } : {}) };
+}

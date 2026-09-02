@@ -23,9 +23,12 @@ import {
 } from "./artifacts.js";
 import { detectExternalTools } from "./capabilities.js";
 import { loadConfig, type KanbanConfig } from "./config.js";
+import { startImplementLoop } from "./implementloop.js";
+import { deleteLoopArtifacts, sweepLoopWorktrees } from "./looplog.js";
 import {
   abortPipelineFor,
   clearPipelineRegistry,
+  hasLiveRun,
   runCritiqueGate,
   startPipeline,
   type OrchestratorDeps,
@@ -36,7 +39,7 @@ import {
   parseStageOutput,
   stagePrompt,
 } from "./prompts.js";
-import { selectRunner } from "./runner.js";
+import { createInProcessRunner, selectRunner } from "./runner.js";
 import {
   advanceStage,
   createSession,
@@ -338,6 +341,56 @@ function pipelineDeps(
 }
 
 /**
+ * The loop FORCES the in-process backend regardless of config.runner (plan §2.3): iterations
+ * must run in a child session whose cwd is the iteration worktree, and `pi -p` is not available
+ * to every user.
+ */
+function loopDeps(config: KanbanConfig) {
+  return { runChild: createInProcessRunner(), config };
+}
+
+/**
+ * `/kanban implement`. When the loop is enabled this starts the ORCHESTRATOR-owned experiment
+ * loop (an explicit AGENTS.md implement-ownership change); when it is disabled implement stays
+ * AGENT-owned and this is exactly today's `/kanban open` behaviour.
+ */
+async function implementCommand(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  stop: boolean,
+): Promise<void> {
+  const state = await load(ctx.cwd);
+  const session = requireSelectedSession(state);
+  if (stop) {
+    ctx.ui.notify(
+      abortPipelineFor(session.title)
+        ? `Stopped the live Kanban run for “${session.title}”. Nothing was landed.`
+        : `No Kanban run is live for “${session.title}”.`,
+      "info",
+    );
+    return;
+  }
+  if (session.state !== "active") {
+    ctx.ui.notify(`Kanban session “${session.title}” is paused. Use /kanban unpause first.`, "info");
+    return;
+  }
+  if (session.stage !== "implement") {
+    ctx.ui.notify(
+      `Kanban session “${session.title}” is at the ${session.stage} stage; /kanban implement is only valid at the implement stage.`,
+      "info",
+    );
+    return;
+  }
+  const config = await configFor(ctx);
+  if (!config.loop.enabled) {
+    const recorded = await sections(ctx.cwd, session);
+    await openImplementConversation(pi, ctx, session, config, recorded.compose);
+    return;
+  }
+  await startImplementLoop(ctx, session.title, loopDeps(config));
+}
+
+/**
  * Open a fresh conversation seeded with the durable context. `kickoff` (when given) is sent
  * as the first user message; `afterSwitch` runs against the replacement context.
  */
@@ -492,6 +545,7 @@ async function removeSessionPermanently(
   try {
     await rm(safePlanFile(ctx.cwd, removed.value), { force: true });
     await deleteWorkfile(ctx.cwd, workfileBase(removed.value.planPath));
+    await deleteLoopArtifacts(ctx.cwd, workfileBase(removed.value.planPath));
   } catch (error) {
     ctx.ui.notify(
       `Removed “${removed.value.title}” from the board, but its plan could not be deleted: ${error instanceof Error ? error.message : String(error)}`,
@@ -599,6 +653,7 @@ async function completeSession(
     return base;
   });
   await deleteWorkfile(ctx.cwd, done.value);
+  await deleteLoopArtifacts(ctx.cwd, done.value).catch(() => undefined);
   await refreshWidget(ctx, done.state);
   return toolResult(
     completionText(config, archivedPlan!),
@@ -655,6 +710,13 @@ export default function kanban(pi: ExtensionAPI): void {
       );
     } catch {
       // Sweeping is best-effort cleanup; never block startup on it.
+    }
+    try {
+      // Removes only DEAD-owner loop worktrees: a second Pi process must never sweep a live
+      // loop's worktrees (plan §7).
+      await sweepLoopWorktrees(ctx.cwd);
+    } catch {
+      // Recovery is best-effort cleanup; never block startup on it.
     }
   });
   pi.on("session_shutdown", async () => {
@@ -749,7 +811,7 @@ export default function kanban(pi: ExtensionAPI): void {
 
   pi.registerCommand("kanban", {
     description:
-      "Open the durable Kanban dashboard, create a session, open/resume one, edit config, complete a pending archive, or pause/remove the current session",
+      "Open the durable Kanban dashboard, create a session, open/resume one, start or stop the implement loop, edit config, complete a pending archive, or pause/remove the current session",
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       const [verb, ...rest] = trimmed ? trimmed.split(/\s+/) : [];
@@ -795,6 +857,15 @@ export default function kanban(pi: ExtensionAPI): void {
         if (verb === "open") {
           const title = body || requireSelectedSession(await load(ctx.cwd)).title;
           await openSession(pi, ctx, title);
+          return;
+        }
+
+        if (verb === "implement") {
+          if (body && body !== "stop") {
+            ctx.ui.notify("Usage: /kanban implement [stop]", "error");
+            return;
+          }
+          await implementCommand(pi, ctx, body === "stop");
           return;
         }
 
@@ -857,7 +928,7 @@ export default function kanban(pi: ExtensionAPI): void {
         }
 
         ctx.ui.notify(
-          "Unknown Kanban command. Use /kanban, /kanban create, /kanban open, /kanban config, /kanban complete, /kanban pause, /kanban unpause, or /kanban remove.",
+          "Unknown Kanban command. Use /kanban, /kanban create, /kanban open, /kanban implement, /kanban config, /kanban complete, /kanban pause, /kanban unpause, or /kanban remove.",
           "error",
         );
       } catch (error: unknown) {
@@ -1114,6 +1185,14 @@ export default function kanban(pi: ExtensionAPI): void {
       if (mode === "pipeline" && PIPELINE_STAGES.includes(session.stage))
         throw new Error(
           `the ${session.stage} stage is run by the Kanban pipeline; use /kanban open to resume it`,
+        );
+
+      // Keyed on a LIVE in-memory run, never on the durable pipelineToken (which is stale after
+      // a crash and is also left behind by the compose pipeline): a stale token must not block a
+      // manual implement advance.
+      if (session.stage === "implement" && hasLiveRun(session.title))
+        throw new Error(
+          "the Kanban implement loop is running for this session; stop it with /kanban implement stop before completing the stage yourself",
         );
 
       if (session.stage === "critique") {

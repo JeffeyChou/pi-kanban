@@ -15,7 +15,8 @@ Kanban never invokes third-party subagent/background-task tools. Installed tools
 | Pi conversation switching and creation | `/kanban open`-initiated implement conversation; pipeline itself never switches conversations |
 | Tool scheduling and external subagent execution | Compact external-agent roster and role/status records |
 | Model/auth resolution for child sessions (L1 limits it to `~/.pi/agent`-registered providers) | Per-stage model config and fallback to the parent model |
-| Git commands when an agent explicitly runs them | Never automatic staging or committing |
+| Git commands when an agent explicitly runs them | Read-only git, worktree scaffolding, and `git apply` without `--index`; never automatic staging or committing |
+| Filesystem isolation for child sessions (Kanban has none to give) | Per-iteration `git worktree` experiment isolation for the implement loop |
 
 ## Component contracts
 
@@ -24,7 +25,11 @@ Kanban never invokes third-party subagent/background-task tools. Installed tools
 | `src/index.ts` | Pi context, selected state, plan/handoff | Commands, checkpoints, critique-gate mutations | Keep task/todo graphs, expose durable IDs, switch conversations mid-pipeline, or inject followUp kickoffs |
 | `src/store.ts` | `.kanban/state.json` | Locked atomic v4 state; v1/v2/v3 migration; session modes and pipeline tokens | Store work-item detail, evidence, source lists, model limits, Pi conversation paths, or completed sessions |
 | `src/artifacts.ts` | Existing plan/handoff | Atomic compact plan JSON (plus the bounded archive-time `completion` record) and one bounded handoff | Duplicate state fields into the handoff or accumulate review archives |
-| `src/orchestrator.ts` | State, workfile, config, prompt grammar | Child sessions, title-keyed abort registry, locked one-stage commits, workfile sections | Run children under the lock, auto-switch conversations, or commit without token revalidation |
+| `src/orchestrator.ts` | State, workfile, config, prompt grammar | Child sessions, title-keyed abort registry, locked one-stage commits, workfile sections, the implement-loop run handle | Run children under the lock, auto-switch conversations, or commit without token revalidation |
+| `src/implementloop.ts` | Config `loop`, plan prompt, workfile `## compose`, loop breadcrumbs | Iteration worktrees, iteration records, the best-so-far patch, the landed marker, one locked implement→critique commit | Run `git add`/`git commit`, stage anything, measure before capturing the candidate, land without re-checking HEAD/cleanliness/token, or treat the baseline as a success |
+| `src/worktree.ts` | Repository git state | Detached worktrees, patches captured and applied without the index | Touch the index or HEAD, or shell-interpolate a path |
+| `src/measure.ts` | The opt-in `loop.validate`/`loop.metric` commands | Nothing durable; a `MeasureOutcome` | Throw, run git, write files, or leave a process group alive after a timeout |
+| `src/looplog.ts` | `.kanban/loop/*`, `.kanban/worktrees/*/manifest.json` | Per-base iteration log, living summary, best patch, landed marker, worktree manifest | Use a shared global path or sweep a worktree whose owner PID is alive |
 | `src/runner.ts` | Child spec | Pass-through child-session text | Throw; both backends return `ChildResult` errors |
 | `src/prompts.ts` | Stage inputs | Prompt/system-prompt text, parsed stage output | Mention `init` in stage prompts |
 | `src/config.ts` | Defaults, global + repository config files | Resolved merged `KanbanConfig` | Require a user-maintained model limit |

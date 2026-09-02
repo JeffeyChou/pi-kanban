@@ -18,6 +18,7 @@ function config(runner: KanbanConfig["runner"]): KanbanConfig {
       research: null,
       grill: null,
       compose: null,
+      implement: null,
       critique: null,
     },
     research: { workers: 3 },
@@ -26,6 +27,14 @@ function config(runner: KanbanConfig["runner"]): KanbanConfig {
     runner,
     piBin: "fake-pi",
     init: {},
+    loop: {
+      enabled: false,
+      direction: "higher",
+      maxIterations: 10,
+      noImprovementStreak: 3,
+      measureTimeoutMs: 300_000,
+      hooks: false,
+    },
   };
 }
 

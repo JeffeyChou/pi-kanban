@@ -15,6 +15,10 @@ Before changing an unfamiliar subsystem, read the matching agent reference: [arc
 | `src/prompts.ts` | Per-stage prompts, the output grammar (`parseStageOutput`), the implement kickoff, and the completion text. |
 | `src/config.ts` | Merged global + repository config with auto-detected init commands. |
 | `src/capabilities.ts` | Active external-tool detection for the implement kickoff. |
+| `src/implementloop.ts` | The opt-in orchestrator-owned implement loop: iteration worktrees, fitness, lessons, termination, landing. Read `docs/plans/loop-driver-v2.md` first. |
+| `src/worktree.ts` | Plain-git worktree/patch primitives. Never `git add`/`git commit`; `git apply` never gets `--index`. |
+| `src/measure.ts` | Runs the opt-in `loop.validate`/`loop.metric` commands in their own process group; parses `METRIC <name>=<value>`. |
+| `src/looplog.ts` | `.kanban/loop/<base>.*` breadcrumbs and the owner-PID worktree manifest. |
 | `src/workfile.ts` | The `.kanban/work/<base>.md` section artifact. |
 | `src/artifacts.ts` | Plan JSON (including the bounded archive-time `completion` record) and the single bounded `handoff.md`. |
 | `src/ui.ts` | Themed four-line selected-session widget and title-based keyboard picker. |
@@ -80,7 +84,7 @@ Stage order is fixed:
 refine → research → grill → compose → implement → critique
 ```
 
-In pipeline mode the orchestrator advances the child-owned stages (refine → compose), one stage per locked commit; `stage_complete` advances the agent-owned stages (implement, critique) and every stage in manual mode. Transition instructions ride in the tool result — there is no queued kickoff injection. The final call runs the critique gate (see agent-workflow.md), writes the plan as `complete` with its `completion` record, removes the session from state, deletes the workfile, and carries the configured completion-check command in its result; it resets the handoff only when no active session remains. It does not commit.
+In pipeline mode the orchestrator advances the child-owned stages (refine → compose), one stage per locked commit; `stage_complete` advances the agent-owned stages (implement, critique) and every stage in manual mode. When `config.loop.enabled`, `/kanban implement` makes implement orchestrator-owned too: the loop lands the winning patch as unstaged working-tree changes and its own locked commit advances implement→critique, while `stage_complete(implement)` is refused for as long as that run is live. Transition instructions ride in the tool result — there is no queued kickoff injection. The final call runs the critique gate (see agent-workflow.md), writes the plan as `complete` with its `completion` record, removes the session from state, deletes the workfile, and carries the configured completion-check command in its result; it resets the handoff only when no active session remains. It does not commit.
 
 `session_start` and `model_select` load the durable board and refresh its widget, but never persist or switch Pi conversation paths. `agent_start`, `agent_end`, and `tool_execution_end` refresh the widget from durable state and Pi live data without writing state. Do not reintroduce a per-tool activity log or per-tool mutation: low write frequency and low prompt noise are core requirements.
 
@@ -108,6 +112,8 @@ The selected-session widget is exactly four logical lines: task title, current s
 ## `init.sh` and release checks
 
 `./init.sh` is read-only and reports session context, branch, recent commits, and working tree. `./init.sh --check` validates v4 state selection, the absence of saved Pi conversation paths, and active plans; checks the physical handoff line cap; runs `git diff --check`, `npm run typecheck`, and `npm test`; then prints an unexecuted suggested commit.
+
+`loop.validate` and `loop.metric` are the only commands Kanban itself executes, plus the opt-in `.kanban/hooks/{before,after}-iteration` scripts when `loop.hooks` is set. All of them run only inside a disposable iteration worktree and are never derived from `init.*`.
 
 Init commands come from config (`.kanban/config.json`, `"auto"` resolves to an executable `./init.sh`) and appear only in the implement kickoff, the completion text, and the handoff header when configured. The script, kickoff, tool guidance, and final handoff must all preserve the no-auto-commit rule. Never add `git add` or `git commit` to extension or script automation.
 

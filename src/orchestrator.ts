@@ -63,6 +63,11 @@ export function pipelineRunFor(title: string): Promise<void> | undefined {
   return runs.get(title)?.promise;
 }
 
+/** Liveness of the abort channel itself: the implement loop's stage_complete refusal keys on this. */
+export function hasLiveRun(title: string): boolean {
+  return runs.has(title);
+}
+
 /** Abort + unregister the title's live run (pipeline or critique gate). Used by pause/remove/rename/open. */
 export function abortPipelineFor(title: string): boolean {
   const entry = runs.get(title);
@@ -84,9 +89,9 @@ function unregister(title: string, entry: RunEntry): void {
   if (runs.get(title) === entry) runs.delete(title);
 }
 
-type StopReason = "missing" | "blocked" | "manual" | "stage" | "token" | "aborted";
+export type StopReason = "missing" | "blocked" | "manual" | "stage" | "token" | "aborted";
 
-type Guarded<T> =
+export type Guarded<T> =
   | { ok: true; value: T; state: KanbanState }
   | { ok: false; reason: StopReason };
 
@@ -237,6 +242,10 @@ async function runStageChild(
     prompt: string;
     signal: AbortSignal;
     label: string;
+    /** Overrides ctx.cwd — the implement loop runs each child inside its iteration worktree. */
+    cwd?: string;
+    /** Overrides the read-only CHILD_TOOLS — the implement loop passes the write set. */
+    tools?: readonly string[];
   },
 ): Promise<ChildOutcome> {
   const resolved = resolveModel(ctx, deps.config, options.modelKey);
@@ -247,11 +256,11 @@ async function runStageChild(
     };
   try {
     const result = await deps.runChild({
-      cwd: ctx.cwd,
+      cwd: options.cwd ?? ctx.cwd,
       prompt: options.prompt,
       systemPrompt: stageSystemPrompt(options.stage),
       model: resolved.model,
-      tools: [...CHILD_TOOLS],
+      tools: [...(options.tools ?? CHILD_TOOLS)],
       signal: options.signal,
       onStatus: (line) => ctx.ui.setStatus(STATUS_KEY, `kanban ${options.label}: ${line}`),
     });
@@ -623,10 +632,16 @@ type MintOutcome =
   | { ok: true; state: KanbanState; session: Session }
   | { ok: false; message: string; kind: "info" | "error" };
 
+/**
+ * `allowed` is the set of stages a run may be minted at: CHILD_STAGES for the pipeline, and
+ * `["implement"]` for the orchestrator-owned implement loop (plan v2.5 §4, an explicit
+ * AGENTS.md:41 change).
+ */
 async function mintPipelineToken(
   ctx: ExtensionCommandContext,
   title: string,
   token: string,
+  allowed: Stage[],
 ): Promise<MintOutcome> {
   const minted = await mutateAsync(ctx.cwd, async (state) => {
     const session = state.sessions.find((item) => item.title === title);
@@ -648,11 +663,13 @@ async function mintPipelineToken(
         kind: "info" as const,
         message: `Kanban session “${title}” runs in manual mode; continue it in this conversation.`,
       };
-    if (!CHILD_STAGES.includes(session.stage))
+    if (!allowed.includes(session.stage))
       return {
         ok: false as const,
         kind: "info" as const,
-        message: `Kanban session “${title}” is at the ${session.stage} stage; the pipeline has nothing left to run.`,
+        message: allowed.includes("implement")
+          ? `Kanban session “${title}” is at the ${session.stage} stage; the implement loop runs only at the implement stage.`
+          : `Kanban session “${title}” is at the ${session.stage} stage; the pipeline has nothing left to run.`,
       };
     session.pipelineToken = token;
     session.updatedAt = new Date().toISOString();
@@ -689,7 +706,7 @@ export async function startPipeline(
   // A live run for this title is aborted and unregistered BEFORE the new token is minted.
   abortPipelineFor(title);
   const token = randomUUID();
-  const minted = await mintPipelineToken(ctx, title, token);
+  const minted = await mintPipelineToken(ctx, title, token, CHILD_STAGES);
   if (!minted.ok) {
     ctx.ui.notify(minted.message, minted.kind);
     return;
@@ -712,6 +729,154 @@ export async function startPipeline(
     );
   });
 }
+
+/* ------------------------------------------------------------------------------------------ *
+ * The implement-loop seam (plan v2.5 §4/§5).
+ *
+ * The loop ALGORITHM lives in src/implementloop.ts; the orchestrator keeps ownership of run
+ * identity: the title-keyed abort registry, the pipelineToken CAS, the locked one-stage commit
+ * and the child-session plumbing. The loop only ever touches state through this handle, so it
+ * cannot advance a stage or write a workfile section outside the revalidated locked commit.
+ * ------------------------------------------------------------------------------------------ */
+
+export interface LoopRunDeps {
+  /** FORCED in-process backend (plan §4.2); never selectRunner. */
+  runChild: RunChild;
+  config: KanbanConfig;
+}
+
+export interface LoopChildOptions {
+  prompt: string;
+  /** The iteration worktree — never the user's tree. */
+  cwd: string;
+  tools: readonly string[];
+  label: string;
+}
+
+export interface LoopRunHandle {
+  readonly ctx: ExtensionCommandContext;
+  readonly title: string;
+  readonly token: string;
+  readonly signal: AbortSignal;
+  /** Read-only revalidation: the pre-land CAS and the per-iteration boundary check. */
+  check(
+    expected: Stage | undefined,
+  ): Promise<{ ok: true; session: Session } | { ok: false; reason: StopReason }>;
+  /** ONE locked, revalidated mutation. */
+  mutate<T>(
+    expected: Stage | undefined,
+    body: (state: KanbanState, session: Session) => Promise<T>,
+  ): Promise<Guarded<T>>;
+  /** The one locked commit that writes the section and advances exactly one stage. */
+  commit(
+    stage: Stage,
+    body: string,
+    patch?: (plan: PlanSnapshot) => PlanSnapshot,
+  ): Promise<Guarded<Session>>;
+  /** Roster update so the widget shows the running iteration child. */
+  agents(stage: Stage, agents: AgentRecord[]): Promise<boolean>;
+  child(options: LoopChildOptions): Promise<ChildOutcome>;
+  /** Loop progress goes to the status line, never to a 5th widget row (AGENTS.md:37). */
+  status(line: string | undefined): void;
+  notify(message: string, kind: "info" | "warning" | "error"): void;
+  /** Publish the detached run promise so tests can await it. */
+  track(promise: Promise<void>): void;
+  /** Clear the status line and unregister the run (ABA-guarded). */
+  release(): void;
+  childAgent(name: string, role: string): AgentRecord;
+  boundaryStop(reason: StopReason): void;
+  commitStop(stage: Stage, reason: StopReason): void;
+}
+
+export type LoopArmOutcome =
+  | { ok: true; handle: LoopRunHandle }
+  | { ok: false; message: string; kind: "info" | "error" };
+
+/**
+ * Arm an orchestrator-owned implement-loop run: refuse when ANY live run exists in this
+ * process (one loop per process), then mint a fresh pipelineToken at the implement stage and
+ * register the abort channel under the title, so open/rename/remove/pause/session_shutdown
+ * abort the loop for free.
+ */
+export async function armImplementLoop(
+  ctx: ExtensionCommandContext,
+  title: string,
+  deps: LoopRunDeps,
+): Promise<LoopArmOutcome> {
+  const live = [...runs.keys()][0];
+  if (live !== undefined)
+    return {
+      ok: false,
+      kind: "info",
+      message:
+        live === title
+          ? `A Kanban run is already live for “${title}”. Stop it with /kanban implement stop first.`
+          : `A Kanban pipeline is already running for “${live}”. Pause it or let it finish first.`,
+    };
+  const token = randomUUID();
+  const minted = await mintPipelineToken(ctx, title, token, ["implement"]);
+  if (!minted.ok) return { ok: false, message: minted.message, kind: minted.kind };
+  await refreshWidget(ctx, minted.state);
+
+  const entry: RunEntry = { controller: new AbortController() };
+  runs.set(title, entry);
+  const run: RunContext = {
+    ctx,
+    title,
+    token,
+    signal: entry.controller.signal,
+    // The loop never opens a conversation; the field exists so the shared RunContext type
+    // stays one type. Calling it would violate AGENTS.md:46 and is asserted against in tests.
+    deps: {
+      ...deps,
+      openImplementConversation: async () => {
+        throw new Error("the implement loop never opens a conversation");
+      },
+    },
+  };
+  return {
+    ok: true,
+    handle: {
+      ctx,
+      title,
+      token,
+      signal: entry.controller.signal,
+      check: async (expected) => revalidate(await load(ctx.cwd), run, expected),
+      mutate: (expected, body) => guardedMutate(run, expected, body),
+      commit: (stage, body, patch) => commitStage(run, stage, body, patch),
+      agents: (stage, agents) => announceChildren(run, stage, agents),
+      child: (options) =>
+        runStageChild(ctx, run.deps, {
+          stage: "implement",
+          modelKey: "implement",
+          prompt: options.prompt,
+          signal: run.signal,
+          label: options.label,
+          cwd: options.cwd,
+          tools: options.tools,
+        }),
+      status: (line) => status(run, line),
+      notify: (message, kind) => ctx.ui.notify(message, kind),
+      track: (promise) => {
+        entry.promise = promise;
+      },
+      release: () => {
+        status(run, undefined);
+        unregister(title, entry);
+      },
+      childAgent,
+      boundaryStop: (reason) => notifyBoundaryStop(run, reason),
+      commitStop: (stage, reason) => notifyStop(run, stage, reason),
+    },
+  };
+}
+
+/** Shared with the loop driver: aborted / errored / empty child output. */
+export function loopChildFailed(result: ChildResult): boolean {
+  return childFailed(result);
+}
+
+export type { ChildOutcome };
 
 export interface CritiqueGateDeps {
   runChild: RunChild;

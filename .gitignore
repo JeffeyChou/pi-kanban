@@ -2,3 +2,5 @@ refs/
 .kanban/
 .pi-tasks/
 node_modules/
+.teamux/
+.pi/

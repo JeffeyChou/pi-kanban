@@ -6,13 +6,43 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 
-export type StageModelKey = "refine" | "research" | "grill" | "compose" | "critique";
+export type StageModelKey =
+  | "refine"
+  | "research"
+  | "grill"
+  | "compose"
+  | "implement"
+  | "critique";
 
 export interface InitConfig {
   /** Shell command to run before implementation, or undefined when disabled/not detected. */
   start?: string;
   /** Shell command to run at final completion, or undefined when disabled/not detected. */
   check?: string;
+}
+
+/**
+ * The implement-experiment loop (docs/plans/loop-driver-v2.md). Opt-in: `enabled` false keeps
+ * implement agent-owned. `validate`/`metric` are executed by the loop and are NEVER aliased
+ * from `init.*` (AGENTS.md: init commands are never executed).
+ */
+export interface LoopConfig {
+  enabled: boolean;
+  /** Shell command whose exit code 0 means the iteration validated. */
+  validate?: string;
+  /** Shell command printing `METRIC <name>=<value>`; absent ⇒ validation-only fitness. */
+  metric?: string;
+  /** Name matched in the `METRIC <name>=<value>` line; defaults to any name. */
+  metric_name?: string;
+  direction: "higher" | "lower";
+  /** Metric value at which a `complete` iteration counts as SUCCESS. */
+  target?: number;
+  maxIterations: number;
+  /** Stop after this many consecutive discards. */
+  noImprovementStreak: number;
+  measureTimeoutMs: number;
+  /** Opt-in `.kanban/hooks/{before,after}-iteration` execution. */
+  hooks: boolean;
 }
 
 export interface KanbanConfig {
@@ -26,6 +56,7 @@ export interface KanbanConfig {
   piBin: string;
   /** Resolved init commands ("auto" already resolved against the repository). */
   init: InitConfig;
+  loop: LoopConfig;
 }
 
 export interface LoadedConfig {
@@ -44,6 +75,7 @@ interface RawConfig {
   runner: KanbanConfig["runner"];
   piBin: string;
   init: RawInitConfig;
+  loop: LoopConfig;
 }
 
 interface ConfigLayer {
@@ -54,6 +86,7 @@ interface ConfigLayer {
   runner?: KanbanConfig["runner"];
   piBin?: string;
   init?: Partial<RawInitConfig>;
+  loop?: Partial<LoopConfig>;
 }
 
 const StageModelKeys: StageModelKey[] = [
@@ -61,6 +94,7 @@ const StageModelKeys: StageModelKey[] = [
   "research",
   "grill",
   "compose",
+  "implement",
   "critique",
 ];
 
@@ -78,6 +112,41 @@ const RunnerSchema = Type.Union([
 const BooleanSchema = Type.Boolean();
 const StringSchema = Type.String();
 const InitValueSchema = Type.Union([Type.String(), Type.Null()]);
+const DirectionSchema = Type.Union([
+  Type.Literal("higher"),
+  Type.Literal("lower"),
+]);
+const PositiveIntegerSchema = Type.Integer({ minimum: 1 });
+const FiniteNumberSchema = Type.Number();
+const LoopValueSchemas = {
+  enabled: BooleanSchema,
+  validate: StringSchema,
+  metric: StringSchema,
+  metric_name: StringSchema,
+  direction: DirectionSchema,
+  target: FiniteNumberSchema,
+  maxIterations: PositiveIntegerSchema,
+  noImprovementStreak: PositiveIntegerSchema,
+  measureTimeoutMs: PositiveIntegerSchema,
+  hooks: BooleanSchema,
+} as const;
+const LoopKeys = Object.keys(LoopValueSchemas) as Array<keyof LoopConfig>;
+const LoopSchema = Type.Object(
+  {
+    enabled: BooleanSchema,
+    validate: Type.Optional(StringSchema),
+    metric: Type.Optional(StringSchema),
+    metric_name: Type.Optional(StringSchema),
+    direction: DirectionSchema,
+    target: Type.Optional(FiniteNumberSchema),
+    maxIterations: PositiveIntegerSchema,
+    noImprovementStreak: PositiveIntegerSchema,
+    measureTimeoutMs: PositiveIntegerSchema,
+    hooks: BooleanSchema,
+  },
+  { additionalProperties: false },
+);
+
 const RawConfigSchema = Type.Object(
   {
     models: Type.Object({
@@ -85,6 +154,7 @@ const RawConfigSchema = Type.Object(
       research: ModelValueSchema,
       grill: ModelValueSchema,
       compose: ModelValueSchema,
+      implement: ModelValueSchema,
       critique: ModelValueSchema,
     }),
     research: Type.Object({ workers: WorkersSchema }),
@@ -93,6 +163,7 @@ const RawConfigSchema = Type.Object(
     runner: RunnerSchema,
     piBin: StringSchema,
     init: Type.Object({ start: InitValueSchema, check: InitValueSchema }),
+    loop: LoopSchema,
   },
   { additionalProperties: false },
 );
@@ -103,6 +174,7 @@ const defaults: RawConfig = {
     research: null,
     grill: null,
     compose: null,
+    implement: null,
     critique: null,
   },
   research: { workers: 3 },
@@ -111,6 +183,14 @@ const defaults: RawConfig = {
   runner: "auto",
   piBin: "pi",
   init: { start: "auto", check: "auto" },
+  loop: {
+    enabled: false,
+    direction: "higher",
+    maxIterations: 10,
+    noImprovementStreak: 3,
+    measureTimeoutMs: 300_000,
+    hooks: false,
+  },
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -138,9 +218,16 @@ function configLayer(
   const layer: ConfigLayer = {};
   for (const [key, entry] of Object.entries(value)) {
     if (
-      !["models", "research", "fastPath", "critique", "runner", "piBin", "init"].includes(
-        key,
-      )
+      ![
+        "models",
+        "research",
+        "fastPath",
+        "critique",
+        "runner",
+        "piBin",
+        "init",
+        "loop",
+      ].includes(key)
     ) {
       unknown(warnings, source, key);
       continue;
@@ -209,6 +296,35 @@ function configLayer(
       continue;
     }
 
+    if (key === "loop") {
+      if (!isRecord(entry)) {
+        invalid(warnings, source, key);
+        continue;
+      }
+      const loop: Partial<LoopConfig> = {};
+      for (const [loopKey, loopValue] of Object.entries(entry)) {
+        if (!LoopKeys.includes(loopKey as keyof LoopConfig)) {
+          unknown(warnings, `${source}.loop`, loopKey);
+          continue;
+        }
+
+        const typedKey = loopKey as keyof LoopConfig;
+        // Null is deliberately invalid for optional loop commands. Unlike init's resolved
+        // values, loop layers have no null "unset" sentinel: accepting one would make a
+        // higher-precedence layer silently erase a command. Users remove the key instead.
+        if (
+          !Value.Check(LoopValueSchemas[typedKey], loopValue) ||
+          (typedKey === "target" && !Number.isFinite(loopValue))
+        ) {
+          invalid(warnings, `${source}.loop`, loopKey);
+          continue;
+        }
+        loop[typedKey] = loopValue as never;
+      }
+      layer.loop = loop;
+      continue;
+    }
+
     if (key === "fastPath" || key === "critique") {
       if (!Value.Check(BooleanSchema, entry)) {
         invalid(warnings, source, key);
@@ -247,6 +363,7 @@ function mergeConfig(...layers: ConfigLayer[]): RawConfig {
       models: { ...merged.models, ...layer.models },
       research: { ...merged.research, ...layer.research },
       init: { ...merged.init, ...layer.init },
+      loop: { ...merged.loop, ...layer.loop },
     }),
     defaults,
   );
@@ -322,6 +439,7 @@ export async function loadConfig(
         models: { ...defaults.models },
         research: { ...defaults.research },
         init: {},
+        loop: { ...defaults.loop },
       },
       warnings,
     };
@@ -346,6 +464,7 @@ export async function loadConfig(
         ...(start === undefined ? {} : { start }),
         ...(check === undefined ? {} : { check }),
       },
+      loop: { ...merged.loop },
     },
     warnings,
   };

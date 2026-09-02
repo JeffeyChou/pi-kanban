@@ -6,6 +6,8 @@ import {
   RESEARCH_ANGLE_LABELS,
   completionText,
   implementKickoff,
+  implementLoopPrompt,
+  parseImplementLoopOutput,
   parseStageOutput,
   stagePrompt,
   stageSystemPrompt,
@@ -15,13 +17,28 @@ import { STAGES, type Stage } from "../src/store.js";
 
 function config(overrides: Partial<KanbanConfig> = {}): KanbanConfig {
   return {
-    models: { refine: null, research: null, grill: null, compose: null, critique: null },
+    models: {
+      refine: null,
+      research: null,
+      grill: null,
+      compose: null,
+      implement: null,
+      critique: null,
+    },
     research: { workers: 3 },
     fastPath: true,
     critique: true,
     runner: "auto",
     piBin: "pi",
     init: {},
+    loop: {
+      enabled: false,
+      direction: "higher",
+      maxIterations: 10,
+      noImprovementStreak: 3,
+      measureTimeoutMs: 300_000,
+      hooks: false,
+    },
     ...overrides,
   };
 }
@@ -235,4 +252,75 @@ test("completionText carries init-check, the suggested commit, and accepted issu
   assert.match(accepted, /accepted critique issues/);
   assert.match(accepted, /token cleanup untested/);
   assert.match(accepted, /Suggested commit/);
+});
+
+test("the implement loop prompt carries the spec, the lessons, and the verdict grammar", () => {
+  const prompt = implementLoopPrompt({
+    title: "Loop session",
+    prompt: "Raise the value",
+    spec: "Edit app.ts so that value is larger.",
+    lessons: "Iteration 1 tried a bad edit. Discarded because the validation command failed.",
+    iteration: 2,
+    maxIterations: 5,
+    validate: "npm test",
+    hasMetric: true,
+    metricName: "score",
+    direction: "higher",
+    target: 10,
+    bestMetric: 4,
+  });
+  assert.match(prompt, /iteration 2 of 5/);
+  assert.match(prompt, /Edit app\.ts so that value is larger\./);
+  assert.match(prompt, /Discarded because the validation command failed\./);
+  assert.match(prompt, /`npm test`/);
+  assert.match(prompt, /strictly higher than the best so far \(4\); the target is 10/);
+  assert.match(prompt, /You have NO shell/);
+  assert.match(prompt, /Status: complete/);
+  assert.match(prompt, /Rationale: <one line>/);
+  // The loop prompt must never carry an init command (AGENTS.md).
+  assert.equal(/init\.sh/.test(prompt), false);
+});
+
+test("the implement loop prompt omits the metric prose when no metric is configured", () => {
+  const prompt = implementLoopPrompt({
+    title: "Loop session",
+    prompt: "Raise the value",
+    iteration: 1,
+    maxIterations: 3,
+    validate: "npm test",
+  });
+  assert.equal(/A metric/.test(prompt), false);
+  assert.match(prompt, /No compose section was recorded/);
+});
+
+test("the implement verdict defaults to continue and takes the last Status line", () => {
+  assert.deepEqual(parseImplementLoopOutput("Status: complete\nRationale: done"), {
+    verdict: "complete",
+    rationale: "done",
+  });
+  assert.deepEqual(parseImplementLoopOutput("**Status:** continue"), { verdict: "continue" });
+  assert.deepEqual(parseImplementLoopOutput("Status: complete\nStatus: continue"), {
+    verdict: "continue",
+  });
+  assert.deepEqual(parseImplementLoopOutput("no verdict at all"), { verdict: "continue" });
+  // A line that merely ECHOES the required grammar must never score as a verdict: this verdict
+  // gates the stage advance, so prefix leniency would buy a false advance.
+  assert.deepEqual(parseImplementLoopOutput("- Status: complete when the spec is met"), {
+    verdict: "continue",
+  });
+  assert.deepEqual(parseImplementLoopOutput("Status: continue for now, then complete"), {
+    verdict: "continue",
+  });
+  // Markdown emphasis and trailing punctuation around a real verdict still parse.
+  assert.deepEqual(parseImplementLoopOutput("Status: **complete**."), { verdict: "complete" });
+  assert.deepEqual(parseImplementLoopOutput(""), { verdict: "continue" });
+  // Case-insensitive, but only for an exact verdict: trailing prose is not a verdict.
+  assert.deepEqual(parseImplementLoopOutput("Status: COMPLETE\nRationale: shipped"), {
+    verdict: "complete",
+    rationale: "shipped",
+  });
+  assert.deepEqual(parseImplementLoopOutput("Status: Complete now\nRationale: shipped"), {
+    verdict: "continue",
+    rationale: "shipped",
+  });
 });

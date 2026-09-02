@@ -27,7 +27,11 @@ test("config layers use defaults, then agent configuration, then repository conf
     await writeFile(
       join(cwd, ".kanban", "config.json"),
       JSON.stringify({
-        models: { refine: "project:refine-model", critique: "project:review" },
+        models: {
+          refine: "project:refine-model",
+          implement: "project:implement-model",
+          critique: "project:review",
+        },
         research: { workers: 2 },
         fastPath: true,
         init: { start: null, check: "verify-project" },
@@ -40,6 +44,7 @@ test("config layers use defaults, then agent configuration, then repository conf
       research: null,
       grill: null,
       compose: null,
+      implement: "project:implement-model",
       critique: "project:review",
     });
     assert.equal(loaded.config.fastPath, true);
@@ -48,6 +53,147 @@ test("config layers use defaults, then agent configuration, then repository conf
     assert.equal(loaded.config.piBin, "agent-pi");
     assert.deepEqual(loaded.config.init, { check: "verify-project" });
     assert.deepEqual(loaded.warnings, []);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("loop configuration has explicit defaults and accepts a complete valid layer", async () => {
+  const cwd = await sandbox();
+  const agentDir = join(cwd, "agent");
+  try {
+    const defaults = await loadConfig(cwd, agentDir);
+    assert.deepEqual(defaults.config.loop, {
+      enabled: false,
+      direction: "higher",
+      maxIterations: 10,
+      noImprovementStreak: 3,
+      measureTimeoutMs: 300_000,
+      hooks: false,
+    });
+
+    await mkdir(join(cwd, ".kanban"), { recursive: true });
+    await writeFile(
+      join(cwd, ".kanban", "config.json"),
+      JSON.stringify({
+        loop: {
+          enabled: true,
+          validate: "npm test && npm run typecheck",
+          metric: "node measure.js",
+          metric_name: "latency_ms",
+          direction: "lower",
+          target: 12.5,
+          maxIterations: 7,
+          noImprovementStreak: 2,
+          measureTimeoutMs: 1234,
+          hooks: true,
+        },
+      }),
+    );
+
+    const configured = await loadConfig(cwd, agentDir);
+    assert.deepEqual(configured.config.loop, {
+      enabled: true,
+      validate: "npm test && npm run typecheck",
+      metric: "node measure.js",
+      metric_name: "latency_ms",
+      direction: "lower",
+      target: 12.5,
+      maxIterations: 7,
+      noImprovementStreak: 2,
+      measureTimeoutMs: 1234,
+      hooks: true,
+    });
+    assert.deepEqual(configured.warnings, []);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("project loop values override user values without inheriting init commands", async () => {
+  const cwd = await sandbox();
+  const agentDir = join(cwd, "agent");
+  try {
+    await mkdir(join(agentDir, "extensions"), { recursive: true });
+    await mkdir(join(cwd, ".kanban"), { recursive: true });
+    await writeFile(
+      join(agentDir, "extensions", "kanban.json"),
+      JSON.stringify({
+        loop: {
+          enabled: true,
+          validate: "user-validate",
+          metric: "user-metric",
+          direction: "higher",
+          maxIterations: 20,
+        },
+      }),
+    );
+    await writeFile(
+      join(cwd, ".kanban", "config.json"),
+      JSON.stringify({
+        loop: { direction: "lower", maxIterations: 4 },
+        init: { check: "./init.sh --check" },
+      }),
+    );
+
+    const loaded = await loadConfig(cwd, agentDir);
+    assert.equal(loaded.config.loop.enabled, true);
+    assert.equal(loaded.config.loop.validate, "user-validate");
+    assert.equal(loaded.config.loop.metric, "user-metric");
+    assert.equal(loaded.config.loop.direction, "lower");
+    assert.equal(loaded.config.loop.maxIterations, 4);
+    assert.equal(loaded.config.init.check, "./init.sh --check");
+    assert.equal(loaded.config.loop.validate, "user-validate");
+    assert.equal(loaded.config.loop.metric, "user-metric");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("loop validation warns for unknown, null, invalid, and non-finite values", async () => {
+  const cwd = await sandbox();
+  const agentDir = join(cwd, "agent");
+  try {
+    await mkdir(join(cwd, ".kanban"), { recursive: true });
+    await writeFile(
+      join(cwd, ".kanban", "config.json"),
+      // `1e999` is valid JSON parsed as Infinity, so it exercises finite-number validation.
+      '{"loop":{"unknown":true,"enabled":"yes","validate":null,"metric":false,"metric_name":0,"direction":"sideways","target":1e999,"maxIterations":0,"noImprovementStreak":-1,"measureTimeoutMs":0,"hooks":1}}',
+    );
+    const invalid = await loadConfig(cwd, agentDir);
+    assert.deepEqual(invalid.config.loop, {
+      enabled: false,
+      direction: "higher",
+      maxIterations: 10,
+      noImprovementStreak: 3,
+      measureTimeoutMs: 300_000,
+      hooks: false,
+    });
+    assert.equal(invalid.warnings.length, 11);
+    for (const key of [
+      "unknown",
+      "enabled",
+      "validate",
+      "metric",
+      "metric_name",
+      "direction",
+      "target",
+      "maxIterations",
+      "noImprovementStreak",
+      "measureTimeoutMs",
+      "hooks",
+    ]) {
+      assert.match(invalid.warnings.join("\n"), new RegExp(`loop\\.${key}`));
+    }
+
+    await writeFile(
+      join(cwd, ".kanban", "config.json"),
+      '{"loop":{"maxIterations":-1,"target":NaN}}',
+    );
+    const negativeAndNaN = await loadConfig(cwd, agentDir);
+    assert.equal(negativeAndNaN.config.loop.maxIterations, 10);
+    assert.equal(negativeAndNaN.config.loop.target, undefined);
+    assert.match(negativeAndNaN.warnings.join("\n"), /Invalid JSON/);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

@@ -86,6 +86,24 @@ The workfile is the pipeline's transient per-stage output artifact, one file per
 
 - **Sole writer**: the orchestrator (child stages) or the critique tool, always inside the same locked commit that advances the stage. Section bodies never include the `## <stage>` heading — the writer owns those heading lines and a read returns bodies without them.
 - **Sections**: one `## <stage>` section per stage, each capped at 300 lines at write time (truncated with a note); writes atomically replace one section and preserve the others.
+### `.kanban/loop/<base>.*` and `.kanban/worktrees/<base>/` (implement loop, opt-in)
+
+Per session base, never a shared global path, so a second session or a crashed run can never
+overwrite another's:
+
+| Path | Contents |
+| --- | --- |
+| `loop/<base>.jsonl` | One JSON record per iteration: decision, changed summary, validation, metric, failure reason, lesson, verdict. |
+| `loop/<base>.md` | The bounded living summary injected into the next iteration's prompt. |
+| `loop/<base>.patch` | The best-so-far patch, always written before landing so a failed `git apply` is recoverable by hand. |
+| `loop/<base>.landed` | Atomic `{ base, patchSha }` marker written after a successful apply and BEFORE the advancing mutate, so a re-run never applies the same patch twice. |
+| `worktrees/<base>/<n>` | The disposable iteration worktree (detached, no branch), force-removed after the iteration. |
+| `worktrees/<base>/manifest.json` | Active worktree paths with their owner PID and start time. Startup removes only dead-owner worktrees. |
+
+The loop adds NO `state.json` field: its run identity is the existing `mode: "pipeline"` plus
+`pipelineToken`. Artifacts are deleted after a successful advance and at `/kanban remove`, and are
+deliberately KEPT after EXHAUSTED or FAILURE so the lessons and the patch survive for the user.
+
 - **Resume authority is `state.json`'s stage ONLY**: sections are prompt inputs. `/kanban open` on a child-run stage re-runs the CURRENT stage (a stale section for it is overwritten). At implement/critique it opens the conversation; a missing workfile there is tolerated — the seed notes "spec unavailable" and the agent proceeds from the plan JSON.
 - **Lifecycle**: created on the first section write; deleted at final completion and at `/kanban remove`; never created by migration; orphans (base matching no session in ANY state, active or blocked) are swept at startup — a paused session keeps its workfile.
 
