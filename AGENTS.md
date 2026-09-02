@@ -47,7 +47,6 @@ Develop `kanban`, a local Pi extension for durable, low-noise Kanban sessions. T
 - The critique gate is enforced: one stage per `stage_complete(critique)`, a 2-attempt cap (a plain call at the cap must pass `rerunCritique` or `acceptRemainingIssues`; early accept before the cap is refused), durable `plan.gateFailure` on gate-child failure (which is the only thing that authorizes a pipeline-mode `critiqueSummary`), and `/kanban complete` as the escape hatch, valid only while `plan.pendingCompletion` exists. There is no `skipRemaining`.
 - The blocked-state guard: every agent-owned mutation (checkpoint, `stage_complete` variants, gate-token mint, `/kanban complete`) requires `state === "active"` and the expected stage in its locked predicate.
 - Resume a saved Pi conversation when available; otherwise seed a new one from the single handoff and selected plan.
-- Never run `git add` or `git commit` automatically. After validation, output a suggested commit and let the user decide.
 
 ## Change guidelines
 
