@@ -21,6 +21,8 @@ import {
   type LoopRunManifest,
 } from "./looplog.js";
 import { measure, type MeasureOutcome } from "./measure.js";
+import { beginLoopProgress, updateLoopProgress } from "./liveprogress.js";
+import { startLoopWidget } from "./ui.js";
 import {
   armImplementLoop,
   loopChildFailed,
@@ -403,6 +405,7 @@ async function runIteration(
   if (!opened.ok) return discarded(opened.error, `Could not set up the experiment: ${opened.error}.`);
   const worktree = opened.path;
   try {
+    updateLoopProgress(setup.handle.signal, { iteration: input.iteration, best: input.bestMetric });
     setup.handle.status(
       `kanban implement: iteration ${input.iteration}/${setup.loop.maxIterations} — child session`,
     );
@@ -450,6 +453,7 @@ async function runIteration(
     }
 
     const parsed = parseImplementLoopOutput(outcome.result.text);
+    await setup.handle.agents("implement", []);
     // The candidate is captured BEFORE measuring, so measurement debris (build output, caches)
     // can never enter the patch.
     let candidate: string;
@@ -462,6 +466,7 @@ async function runIteration(
         `Iteration ${input.iteration} could not be captured (${detail}); its work was dropped.`,
       );
     }
+    setup.handle.status(`kanban implement: iteration ${input.iteration}/${setup.loop.maxIterations} — measuring candidate`);
     const measured = await setup.measure(worktree, setup.loop, setup.handle.signal, {
       KANBAN_ITERATION: String(input.iteration),
       KANBAN_MAX_ITERATIONS: String(setup.loop.maxIterations),
@@ -699,6 +704,11 @@ async function driveLoop(setup: LoopSetup): Promise<LoopResult> {
       streak += 1;
     }
     await checkpoint("running", iteration + 1);
+    updateLoopProgress(setup.handle.signal, {
+      latest: outcome.metric, best: bestMetric,
+      comment: `${outcome.record.decision}: ${outcome.record.failureReason ?? outcome.record.changed?.split("\n").at(-1) ?? outcome.record.lesson ?? "no rationale provided"}`,
+      activity: success ? "target met; preparing landing" : "iteration recorded",
+    });
 
     if (outcome.stop) {
       stopped = {
@@ -918,6 +928,11 @@ export async function startImplementLoop(
     readWorkfile(ctx.cwd, base).catch(() => ({ sections: {} }) as Workfile),
   ]);
   const measureFn = deps.measure ?? measure;
+  beginLoopProgress(ctx.cwd, base, handle.signal, {
+    title, goal: plan?.prompt?.trim() || title, maxIterations: loop.maxIterations,
+    direction: loop.direction, target: loop.target, metricName: loop.metric_name,
+  });
+  startLoopWidget(ctx, base, handle.signal);
 
   let baseline: MeasureOutcome;
   let manifest: LoopRunManifest;
@@ -1031,6 +1046,7 @@ export async function startImplementLoop(
     baseline,
     measure: measureFn,
   };
+  updateLoopProgress(handle.signal, { baseline: baseline.metric, best: manifest.bestMetric });
 
   const run = driveLoop(setup)
     .catch((error: unknown): LoopResult => {
@@ -1040,6 +1056,10 @@ export async function startImplementLoop(
         "error",
       );
       return { kind: "stopped", iterations: 0, landed: false, advanced: false, message };
+    })
+    .then((result) => {
+      updateLoopProgress(handle.signal, { activity: `${result.kind}: ${result.message ?? (result.landed ? "best result landed" : "nothing landed")}` });
+      return result;
     })
     .finally(() => {
       handle.release();

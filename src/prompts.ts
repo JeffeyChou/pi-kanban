@@ -10,10 +10,19 @@ export interface StageInputs {
   sections: Partial<Record<Stage, string>>;
   /** Research workers only. */
   researchAngle?: 1 | 2 | 3;
+  researchAngles?: Array<1 | 2 | 3>;
+  researchDepth?: "focused" | "deep";
+  composeDetail?: "plan" | "concise" | "detailed";
   /** Orchestrator-collected grill Q&A (compose input). */
   grillAnswers?: string;
   /** Critique only: tool-computed, bounded diff. */
   diff?: string;
+}
+
+export interface GrillQuestion {
+  q: string;
+  recommended: string;
+  options?: Array<{ label: string; description: string }>;
 }
 
 export interface ParsedStageOutput {
@@ -22,7 +31,7 @@ export interface ParsedStageOutput {
   /** refine only; defaults to "standard". */
   verdict?: "simple" | "standard";
   /** grill only. */
-  questions?: Array<{ q: string; recommended: string }>;
+  questions?: GrillQuestion[];
   /** critique only; missing/unparseable ⇒ "fail". */
   gate?: "pass" | "fail";
   /** critique FAIL bullets; empty ⇒ ["critique produced no parseable issues"]. */
@@ -52,7 +61,7 @@ const RESPONSIBILITIES: Record<Stage, string> = {
   grill:
     "Challenge the work: name the assumptions it rests on, the failure modes, the compatibility and safety risks, and the decisions still open. Settle what the repository can answer, and surface the rest as questions for the user.",
   compose:
-    "Produce the decision-complete implementation spec: every file to change, the change in each, the order to make them in, the validation to run, and the risks to watch. A capable agent must be able to execute it without asking a further question.",
+    "Synthesize the recorded findings and user decisions into an actionable implementation spec. Settle scope, behavior, interfaces, compatibility, and validation; leave routine coding choices to implementation. Group work by coherent change, with relevant file paths. Do not write code or repeat the repository survey.",
   implement:
     "Execute the composed spec and validate the result. Keep the durable Kanban record current at material milestones only.",
   critique:
@@ -99,19 +108,23 @@ function outputRules(stage: Stage, inputs: StageInputs): string[] {
   if (stage === "research")
     rules.push(
       "",
-      inputs.researchAngle
-        ? `Report your angle only. Another worker covers each of the other angles, and the Kanban pipeline merges the ${RESEARCH_ANGLE_LABELS.length} sections.`
+      inputs.researchAngle || inputs.researchAngles
+        ? "Report only your assigned angles. The pipeline merges worker findings; do not duplicate other workers' coverage."
         : "Cover each research angle under its own `###` sub-heading.",
     );
   if (stage === "grill")
     rules.push(
       "",
-      "Put what you settled yourself under a `### Settled` sub-heading. Then, under a `### Open questions` sub-heading, write every question that still needs the user's decision as a `Q:` line followed immediately by a `Recommended:` line carrying your best answer. Use exactly those two prefixes, one question per pair; the pipeline asks the user each pair and records the answers. Write no other `Q:` or `Recommended:` lines.",
+      "Put settled repository facts under `### Settled`. Under `### Open questions`, ask at most 3 high-impact questions that actually need a user preference or scope decision; consolidate related decisions. Do not ask for approval of facts or routine coding choices. If none remain, write `Questions: none`.",
+      "For each question use this exact grammar: `Q: <question>`, then 2–4 `Option: <short label> | <one-sentence explanation of impact or trade-off>` lines, then `Recommended: <exact label of your preferred option>`. Offer distinct, concrete alternatives, with the recommendation first. Do not generate approve/skip/free-text options; the UI supplies the free-text action. Use the user's language for questions, labels, and explanations, keeping these parser prefixes in English.",
     );
   if (stage === "compose")
     rules.push(
       "",
-      "The section IS the spec: files to change with their paths, the change in each, the order of the changes, the exact validation commands to run afterwards, and the risks to watch. Decide every open choice; do not hand the reader options.",
+      "The section IS the spec: goal and acceptance criteria, ordered implementation steps with relevant paths, validation commands supported by the findings, and material risks. Preserve the user's choices. State missing evidence explicitly; never invent paths or validation commands. Do not expand it into per-function pseudocode or a line-by-line editing script.",
+      "Write a reviewable Markdown implementation plan in the user's language. After `## compose`, use these level-3 sections (translate the section titles as appropriate): `### Summary`, `### Goals and non-goals`, `### Proposed approach`, `### Implementation steps`, `### Validation and acceptance`, and `### Risks and assumptions`. Keep the outer `## compose` heading unchanged.",
+      "In Implementation steps, use an ordered list of coherent changes; for each step state the behavior to change, relevant module/file paths, dependencies, and how to verify it. Explain important API/data/compatibility decisions in Proposed approach. Validation and acceptance must connect each success criterion with a concrete test or observable result. Carry forward the user's settled choices and label any remaining assumptions. Include rollout/rollback only when relevant. Avoid speculative implementation code, redundant research, and trivial editing instructions.",
+      "The complete plan, INCLUDING the `## compose` heading, MUST fit within 300 physical lines. Treat 300 as a ceiling, not a target: a small change should have a short plan. Review the length before responding; an oversized plan will not advance to implementation.",
     );
   if (stage === "critique")
     rules.push(
@@ -124,7 +137,9 @@ function outputRules(stage: Stage, inputs: StageInputs): string[] {
 export function stagePrompt(stage: Stage, inputs: StageInputs): string {
   const later = laterStages(stage);
   const responsibility =
-    stage === "research" && inputs.researchAngle
+    stage === "research" && inputs.researchAngles
+      ? inputs.researchAngles.map((angle) => `${RESEARCH_ANGLE_LABELS[angle - 1]}: ${RESEARCH_ANGLE_BRIEFS[angle - 1]}`).join("\n\n")
+      : stage === "research" && inputs.researchAngle
       ? `${RESEARCH_ANGLE_BRIEFS[inputs.researchAngle - 1]}\n\nYour angle is ${inputs.researchAngle} of ${RESEARCH_ANGLE_LABELS.length}: ${RESEARCH_ANGLE_LABELS[inputs.researchAngle - 1]}.`
       : RESPONSIBILITIES[stage];
   const lines: string[] = [
@@ -153,6 +168,18 @@ export function stagePrompt(stage: Stage, inputs: StageInputs): string {
         ? fence(inputs.diff.trim())
         : "No diff was captured. Treat an empty diff as a failed review unless the recorded spec required no change.",
     );
+  if (stage === "research")
+    lines.push(inputs.researchDepth === "deep"
+      ? "- Deep research: trace direct dependencies and relevant compatibility/test edge cases. Stop once assigned claims are supported; keep each angle within 70 lines."
+      : "- Focused research: inspect the directly affected modules, their immediate callers, and relevant tests/docs. Stop once scope, code facts, and validation are supported. Avoid a repository-wide survey and speculative alternatives. Aim for at most 6 targeted tool calls and 35 output lines per assigned angle; explain any unresolved evidence gaps.");
+  if (stage === "grill")
+    lines.push("- Reuse recorded research. Read only to close a specific decision-critical gap, aiming for at most 3 targeted tool calls. Keep the section within 80 lines including questions; do not repeat the research stage.");
+  if (stage === "compose")
+    lines.push(inputs.composeDetail === "detailed"
+      ? "- Detail: include cross-component sequencing and interface contracts, within 220 lines. Reuse recorded facts; investigate only missing evidence needed for an implementation decision."
+      : inputs.composeDetail === "concise"
+        ? "- Concise plan: aim for 3–7 coherent steps and at most 100 lines. Reuse recorded research and grill answers; aim for at most 3 targeted tool calls to fill essential gaps. Do not reopen settled decisions. A small request needs only a short plan."
+        : "- Implementation plan: organize 3–7 coherent steps, with enough detail to review the approach, interfaces, risks, and validation. A substantial request usually needs 120–240 lines; smaller changes need fewer. Stay within the 300-line ceiling. Reuse recorded research and grill answers; aim for at most 3 targeted tool calls to fill essential gaps. Do not reopen settled decisions.");
 
   lines.push("", "## Your single responsibility", "", responsibility, "", "## Working rules", "");
   if (READ_ONLY_STAGES.includes(stage))
@@ -194,20 +221,35 @@ function labelled(line: string, label: string): string | undefined {
   return match ? match[1]!.trim() : undefined;
 }
 
-function parseQuestions(body: string): Array<{ q: string; recommended: string }> {
-  const questions: Array<{ q: string; recommended: string }> = [];
-  let pending: string | undefined;
+function parseQuestions(body: string): GrillQuestion[] {
+  const questions: GrillQuestion[] = [];
+  let pending: GrillQuestion | undefined;
+  const flush = () => {
+    if (pending?.q && pending.recommended) questions.push(pending);
+    pending = undefined;
+  };
   for (const line of body.split(/\r?\n/)) {
     const question = labelled(line, "Q");
     if (question !== undefined) {
-      pending = question || undefined;
+      flush();
+      pending = question ? { q: question, recommended: "" } : undefined;
+      continue;
+    }
+    if (/^\s*#{1,6}\s/.test(line)) { flush(); continue; }
+    const option = labelled(line, "Option");
+    if (pending && option !== undefined) {
+      const separator = option.indexOf("|");
+      const label = (separator < 0 ? option : option.slice(0, separator)).trim();
+      const description = separator < 0 ? "" : option.slice(separator + 1).trim();
+      if (label && !pending.options?.some((item) => item.label === label))
+        (pending.options ??= []).push({ label, description });
       continue;
     }
     const recommended = labelled(line, "Recommended");
     if (recommended === undefined) continue;
-    if (pending && recommended) questions.push({ q: pending, recommended });
-    pending = undefined;
+    if (pending && recommended) pending.recommended = recommended;
   }
+  flush();
   return questions;
 }
 

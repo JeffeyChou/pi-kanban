@@ -60,7 +60,7 @@ import {
   type SessionState,
   type Stage,
 } from "./store.js";
-import { refreshWidget, showDashboard, showExperimentDashboard } from "./ui.js";
+import { refreshWidget, showDashboard, showExperimentDashboard, showComposedPlan } from "./ui.js";
 import {
   deleteWorkfile,
   readWorkfile,
@@ -912,13 +912,19 @@ export default function kanban(pi: ExtensionAPI): void {
           return;
         }
 
-        if (verb === "experiments") {
+        if (verb === "plan") {
+          if (body) { ctx.ui.notify("Usage: /kanban plan", "error"); return; }
+          await showComposedPlan(ctx, requireSelectedSession(await load(ctx.cwd)));
+          return;
+        }
+
+        if (verb === "experiments" || verb === "progress") {
           if (body) {
-            ctx.ui.notify("Usage: /kanban experiments", "error");
+            ctx.ui.notify(`Usage: /kanban ${verb}`, "error");
             return;
           }
           const session = requireSelectedSession(await load(ctx.cwd));
-          await showExperimentDashboard(ctx, workfileBase(session.planPath));
+          await showExperimentDashboard(ctx, workfileBase(session.planPath), session);
           return;
         }
 
@@ -981,7 +987,7 @@ export default function kanban(pi: ExtensionAPI): void {
         }
 
         ctx.ui.notify(
-          "Unknown Kanban command. Use /kanban, /kanban create, /kanban open, /kanban implement, /kanban experiments, /kanban config, /kanban complete, /kanban pause, /kanban unpause, or /kanban remove.",
+          "Unknown Kanban command. Use /kanban, /kanban create, /kanban open, /kanban implement, /kanban plan, /kanban progress, /kanban experiments, /kanban config, /kanban complete, /kanban pause, /kanban unpause, or /kanban remove.",
           "error",
         );
       } catch (error: unknown) {

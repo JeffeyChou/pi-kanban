@@ -74,7 +74,9 @@ export interface LoopConfig {
 export interface KanbanConfig {
   /** Per-stage model as "provider:model-id"; null → the parent session's current model. */
   models: Record<StageModelKey, string | null>;
-  research: { workers: 1 | 2 | 3 };
+  research: { workers: 1 | 2 | 3; depth?: "focused" | "deep" };
+  compose?: { detail: "plan" | "concise" | "detailed" };
+  pipeline?: { childTimeoutMs: number };
   fastPath: boolean;
   critique: boolean;
   runner: "auto" | "inprocess" | "subprocess";
@@ -96,6 +98,8 @@ type RawInitConfig = Record<"start" | "check", string | null>;
 interface RawConfig {
   models: KanbanConfig["models"];
   research: KanbanConfig["research"];
+  compose: NonNullable<KanbanConfig["compose"]>;
+  pipeline: NonNullable<KanbanConfig["pipeline"]>;
   fastPath: boolean;
   critique: boolean;
   runner: KanbanConfig["runner"];
@@ -107,6 +111,8 @@ interface RawConfig {
 interface ConfigLayer {
   models?: Partial<KanbanConfig["models"]>;
   research?: Partial<KanbanConfig["research"]>;
+  compose?: Partial<NonNullable<KanbanConfig["compose"]>>;
+  pipeline?: Partial<NonNullable<KanbanConfig["pipeline"]>>;
   fastPath?: boolean;
   critique?: boolean;
   runner?: KanbanConfig["runner"];
@@ -147,6 +153,9 @@ const DecisionPolicySchema = Type.Union([
   Type.Literal("agent-with-validation"),
 ]);
 const PositiveIntegerSchema = Type.Integer({ minimum: 1 });
+const DepthSchema = Type.Union([Type.Literal("focused"), Type.Literal("deep")]);
+const DetailSchema = Type.Union([Type.Literal("plan"), Type.Literal("concise"), Type.Literal("detailed")]);
+const ChildTimeoutSchema = Type.Integer({ minimum: 1000, maximum: 3_600_000 });
 const FiniteNumberSchema = Type.Number();
 const PathListSchema = Type.Array(Type.String({ minLength: 1 }), { minItems: 1 });
 const LoopValueSchemas = {
@@ -198,7 +207,9 @@ const RawConfigSchema = Type.Object(
       implement: ModelValueSchema,
       critique: ModelValueSchema,
     }),
-    research: Type.Object({ workers: WorkersSchema }),
+    research: Type.Object({ workers: WorkersSchema, depth: DepthSchema }),
+    compose: Type.Object({ detail: DetailSchema }),
+    pipeline: Type.Object({ childTimeoutMs: ChildTimeoutSchema }),
     fastPath: BooleanSchema,
     critique: BooleanSchema,
     runner: RunnerSchema,
@@ -218,7 +229,9 @@ const defaults: RawConfig = {
     implement: null,
     critique: null,
   },
-  research: { workers: 3 },
+  research: { workers: 2, depth: "focused" },
+  compose: { detail: "plan" },
+  pipeline: { childTimeoutMs: 300_000 },
   fastPath: true,
   critique: true,
   runner: "auto",
@@ -265,6 +278,8 @@ function configLayer(
       ![
         "models",
         "research",
+        "compose",
+        "pipeline",
         "fastPath",
         "critique",
         "runner",
@@ -305,17 +320,38 @@ function configLayer(
       }
       const research: Partial<KanbanConfig["research"]> = {};
       for (const [researchKey, researchValue] of Object.entries(entry)) {
-        if (researchKey !== "workers") {
+        if (researchKey !== "workers" && researchKey !== "depth") {
           unknown(warnings, `${source}.research`, researchKey);
           continue;
         }
-        if (!Value.Check(WorkersSchema, researchValue)) {
+        if (!Value.Check(researchKey === "workers" ? WorkersSchema : DepthSchema, researchValue)) {
           invalid(warnings, `${source}.research`, researchKey);
           continue;
         }
-        research.workers = researchValue;
+        research[researchKey] = researchValue as never;
       }
       layer.research = research;
+      continue;
+    }
+
+    if (key === "compose" || key === "pipeline") {
+      if (!isRecord(entry)) {
+        invalid(warnings, source, key);
+        continue;
+      }
+      for (const [field, fieldValue] of Object.entries(entry)) {
+        const expected = key === "compose" ? "detail" : "childTimeoutMs";
+        if (field !== expected) {
+          unknown(warnings, `${source}.${key}`, field);
+          continue;
+        }
+        if (!Value.Check(key === "compose" ? DetailSchema : ChildTimeoutSchema, fieldValue)) {
+          invalid(warnings, `${source}.${key}`, field);
+          continue;
+        }
+        if (key === "compose") layer.compose = { detail: fieldValue as "plan" | "concise" | "detailed" };
+        else layer.pipeline = { childTimeoutMs: fieldValue as number };
+      }
       continue;
     }
 
@@ -407,6 +443,8 @@ function mergeConfig(...layers: ConfigLayer[]): RawConfig {
       ...("piBin" in layer ? { piBin: layer.piBin! } : {}),
       models: { ...merged.models, ...layer.models },
       research: { ...merged.research, ...layer.research },
+      compose: { ...merged.compose, ...layer.compose },
+      pipeline: { ...merged.pipeline, ...layer.pipeline },
       init: { ...merged.init, ...layer.init },
       loop: { ...merged.loop, ...layer.loop },
     }),
@@ -501,6 +539,8 @@ export async function loadConfig(
     config: {
       models: { ...merged.models },
       research: { ...merged.research },
+      compose: { ...merged.compose },
+      pipeline: { ...merged.pipeline },
       fastPath: merged.fastPath,
       critique: merged.critique,
       runner: merged.runner,

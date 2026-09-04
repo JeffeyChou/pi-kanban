@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import type { LoopConfig } from "./config.js";
+import { appendLiveOutput, updateLoopProgress } from "./liveprogress.js";
 
 export interface MeasureOutcome {
   /** `true` when `loop.validate` is unset (metric-only fitness), else exit code === 0. */
@@ -124,9 +125,11 @@ function runCommand(
       const text = chunk.toString();
       stdout += text;
       output += text;
+      if (!settled) appendLiveOutput(signal, text);
     });
     child.stderr?.on("data", (chunk: Buffer | string) => {
       output += chunk.toString();
+      if (!settled) appendLiveOutput(signal, chunk.toString());
     });
     child.once("error", () => {
       finish({
@@ -201,11 +204,18 @@ export async function measure(
   }
 
   try {
+    const observeCommand = async (kind: "validate" | "metric", command: string) => {
+      updateLoopProgress(signal, { activity: `${kind}: ${command}`, childRunning: false });
+      appendLiveOutput(signal, `\n[${kind}] ${command}\n`);
+      const result = await runCommand(cwd, command, loop.measureTimeoutMs, signal, extraEnv);
+      appendLiveOutput(signal, `\n[${kind}] ${result.timedOut ? "timed out" : result.aborted ? "aborted" : `exit ${result.code ?? "spawn error"}`}\n`);
+      return result;
+    };
     const validation = loop.validate !== undefined
-      ? await runCommand(cwd, loop.validate, loop.measureTimeoutMs, signal, extraEnv)
+      ? await observeCommand("validate", loop.validate)
       : undefined;
     const metricCommand = loop.metric !== undefined
-      ? await runCommand(cwd, loop.metric, loop.measureTimeoutMs, signal, extraEnv)
+      ? await observeCommand("metric", loop.metric)
       : undefined;
     const metric = metricCommand
       ? parseMetric(metricCommand.stdout, loop.metric_name)

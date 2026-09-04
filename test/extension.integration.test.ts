@@ -166,6 +166,56 @@ test("create uses a generated title, starts a clean conversation, and stores no 
   }
 });
 
+test("progress command opens the live dashboard and displays the selected goal", async () => {
+  const cwd = await sandbox();
+  try {
+    await addSession(cwd, "Progress session");
+    const harness = extensionHarness();
+    let output = "";
+    let disposed = false;
+    const ctx = context(cwd, { hasUI: true, ui: {
+      custom: async (factory: any, options: any) => {
+        assert.equal(options?.overlay, undefined);
+        let ready: () => void = () => {};
+        const refreshed = new Promise<void>((resolve) => { ready = resolve; });
+        const component = factory({ requestRender: () => ready() }, { fg: (_: string, text: string) => text, bold: (text: string) => text }, { matches: () => false }, () => { disposed = true; });
+        await refreshed;
+        output = component.render(120).join("\n");
+        component.handleInput("\u001b");
+        component.dispose?.();
+      },
+    } });
+    await harness.commands.get("kanban").handler("progress", ctx);
+    assert.match(output, /Goal: Progress session brief/);
+    assert.match(output, /Agent-owned implementation/);
+    assert.equal(disposed, true);
+  } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
+test("plan command previews the compose section, scrolls, and never changes the conversation", async () => {
+  const cwd = await sandbox();
+  try {
+    const created = await addSession(cwd, "Plan preview");
+    const { writeWorkfileSection, workfileBase } = await import("../src/workfile.js");
+    await writeWorkfileSection(cwd, workfileBase(created.value.planPath), "compose", "### Summary\n" + Array.from({ length: 40 }, (_, i) => `Plan step ${i}`).join("\n"));
+    const harness = extensionHarness();
+    const ctx = context(cwd, { hasUI: true, ui: { custom: async (factory: any) => {
+      let closed = false;
+      const component = factory({ requestRender: () => {}, terminal: { rows: 24 } }, { fg: (_: string, text: string) => text, bold: (text: string) => text }, { matches: () => false }, () => { closed = true; });
+      assert.match(component.render(120).join("\n"), /### Summary/);
+      component.handleInput("\u001b[6~");
+      const second = component.render(120).join("\n");
+      assert.doesNotMatch(second, /### Summary/);
+      assert.match(second, /Plan step 20/);
+      component.handleInput("\u001b");
+      assert.equal(closed, true);
+    } } });
+    await harness.commands.get("kanban").handler("plan", ctx);
+    assert.equal(ctx.freshMessages.length, 0);
+    assert.equal(ctx.setupMessages.length, 0);
+  } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
 test("session startup refreshes a v4 board without persisting a Pi conversation path", async () => {
   const cwd = await sandbox();
   try {

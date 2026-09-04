@@ -8,6 +8,8 @@ import {
   type ChildSpec,
 } from "../src/runner.js";
 import type { KanbanConfig } from "../src/config.js";
+import { beginLoopProgress, loopProgress, endLoopProgress } from "../src/liveprogress.js";
+import { beginUsage, beginChildUsage, getUsage, endUsage } from "../src/usage.js";
 
 const model = { provider: "test-provider", id: "test-model" } as any;
 
@@ -254,6 +256,7 @@ test("subprocess runner passes isolated print-mode arguments and sends the promp
   assert.equal(observed.cwd, "/project");
   assert.deepEqual(observed.args, [
     "-p",
+    "--mode", "json",
     "--no-extensions",
     "--no-skills",
     "--no-context-files",
@@ -301,4 +304,124 @@ test("subprocess failures use the pinned spawn, model, and other classifications
       assert.equal(result.text, "");
     },
   );
+});
+
+test("in-process events expose activity and public output, never thinking text, and unsubscribe", async () => {
+  let listener: (event: any) => void = () => {};
+  let unsubscribed = false;
+  const controller = new AbortController();
+  beginLoopProgress("/runner", "stream", controller.signal, { title: "stream", goal: "test", maxIterations: 1, direction: "higher" });
+  const statuses: string[] = [];
+  class Loader { async reload() {} }
+  const session = {
+    messages: [{ role: "assistant", stopReason: "stop" }],
+    subscribe: (fn: typeof listener) => { listener = fn; return () => { unsubscribed = true; }; },
+    prompt: async () => {
+      listener({ type: "tool_execution_start", toolName: "read" });
+      listener({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "private thought" } });
+      listener({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Updating the affected tests." } });
+    },
+    abort: async () => {}, dispose: () => {}, getLastAssistantText: () => "done",
+  };
+  try {
+    await withRunnerDependencies({ DefaultResourceLoader: Loader, createAgentSession: async () => ({ session }), SessionManager: { inMemory: () => "memory" } }, async () => {
+      await createInProcessRunner()({ ...childSpec(controller.signal), onStatus: (line) => statuses.push(line) });
+    });
+    assert(statuses.includes("using read"));
+    assert(statuses.includes("model thinking"));
+    assert.equal(loopProgress("/runner", "stream")!.output, "Updating the affected tests.");
+    assert(!statuses.join("\n").includes("private thought"));
+    assert.equal(unsubscribed, true);
+  } finally { endLoopProgress(controller.signal); }
+});
+
+test("subprocess JSON stream handles fragmented UTF-8, activity and final model errors", async () => {
+  for (const failure of [false, true]) {
+    const process = new EventEmitter() as EventEmitter & Record<string, any>;
+    process.stdout = new EventEmitter(); process.stderr = new EventEmitter(); process.stdin = new EventEmitter(); process.kill = () => true;
+    const statuses: string[] = [];
+    process.stdin.end = () => {
+      const events = [
+        { type: "tool_execution_start", toolName: "grep" },
+        { type: "message_end", message: { role: "assistant", stopReason: failure ? "error" : "stop", errorMessage: "model unavailable", content: [{ type: "text", text: "## compose\n实现目标" }] } },
+      ];
+      const bytes = Buffer.from(events.map((event) => JSON.stringify(event)).join("\n"));
+      for (let i = 0; i < bytes.length; i += 2) process.stdout.emit("data", bytes.subarray(i, i + 2));
+      process.emit("close", 0);
+    };
+    await withRunnerDependencies({ spawn: () => process }, async () => {
+      const result = await createSubprocessRunner()({ ...childSpec(), onStatus: (line) => statuses.push(line) });
+      if (failure) assert.equal(result.errorKind, "model");
+      else assert.equal(result.text, "## compose\n实现目标");
+    });
+    assert(statuses.includes("using grep"));
+  }
+});
+
+test("in-process usage uses SDK context and cumulative session cost across compaction", async () => {
+  const controller = new AbortController();
+  const childModel = { ...model, contextWindow: 1000 };
+  beginUsage("/runner-usage", "sdk", controller.signal);
+  beginChildUsage(controller.signal, controller.signal, "compose", "compose", childModel);
+  let listener: (event: any) => void = () => {};
+  let tokens: number | null = 800;
+  let total = 1200;
+  let cost = 0.2;
+  const session = {
+    messages: [{ role: "assistant", stopReason: "stop" }],
+    subscribe: (fn: typeof listener) => { listener = fn; return () => {}; },
+    getContextUsage: () => ({ tokens, contextWindow: 1000 }),
+    getSessionStats: () => ({ tokens: { total }, cost, assistantMessages: 1 }),
+    prompt: async () => {
+      listener({ type: "turn_start" });
+      const usage = getUsage("/runner-usage", "sdk")!;
+      assert.equal(usage.children[0]!.contextTokens, 800);
+      assert.equal(usage.totalTokens, 1200);
+      tokens = null;
+      listener({ type: "compaction_end" });
+      assert.equal(usage.children[0]!.contextStale, true);
+      tokens = 200; total = 1500; cost = 0.25;
+      listener({ type: "tool_execution_end", toolName: "read" });
+    },
+    abort: async () => {}, dispose: () => {}, getLastAssistantText: () => "plan",
+  };
+  class Loader { async reload() {} }
+  try {
+    await withRunnerDependencies({ DefaultResourceLoader: Loader, createAgentSession: async () => ({ session }), SessionManager: { inMemory: () => "memory" } }, async () => {
+      await createInProcessRunner()({ ...childSpec(controller.signal), model: childModel });
+    });
+    const usage = getUsage("/runner-usage", "sdk")!;
+    assert.equal(usage.children[0]!.contextTokens, 200);
+    assert.equal(usage.children[0]!.contextStale, false);
+    assert.equal(usage.totalCost, 0.25);
+    assert.equal(usage.totalTokens, 1500);
+  } finally { endUsage(controller.signal); }
+});
+
+test("subprocess usage counts message reports once when agent_end repeats the messages", async () => {
+  const controller = new AbortController();
+  const childModel = { ...model, contextWindow: 1000 };
+  beginUsage("/runner-usage", "json", controller.signal);
+  beginChildUsage(controller.signal, controller.signal, "research", "research", childModel);
+  const process = new EventEmitter() as EventEmitter & Record<string, any>;
+  process.stdout = new EventEmitter(); process.stderr = new EventEmitter(); process.stdin = new EventEmitter(); process.kill = () => true;
+  const message = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "facts" }], usage: { input: 100, output: 20, cacheRead: 50, cacheWrite: 10, cost: { total: 0.1 } } };
+  process.stdin.end = () => {
+    for (const event of [
+      { type: "message_end", message },
+      { type: "compaction_end", aborted: false, result: { usage: { input: 30, output: 6, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } } } },
+      { type: "agent_end", messages: [message] },
+    ]) process.stdout.emit("data", JSON.stringify(event) + "\n");
+    process.emit("close", 0);
+  };
+  try {
+    await withRunnerDependencies({ spawn: () => process }, async () => {
+      await createSubprocessRunner()({ ...childSpec(controller.signal), model: childModel });
+    });
+    const usage = getUsage("/runner-usage", "json")!;
+    assert(Math.abs(usage.totalCost - 0.12) < 1e-10);
+    assert.equal(usage.totalTokens, 216);
+    assert.equal(usage.children[0]!.contextTokens, 180);
+    assert.equal(usage.children[0]!.contextStale, true);
+  } finally { endUsage(controller.signal); }
 });
