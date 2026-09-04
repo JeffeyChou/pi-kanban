@@ -80,13 +80,13 @@ test("context widget follows child stages, uses the tightest window and reverts 
   assert.match(render(), /research context.*awaiting usage/);
   reportUsage(a.signal, { contextTokens: 800, cost: 0.2, totalTokens: 1200 });
   reportUsage(b.signal, { contextTokens: 1000, cost: 0.3, totalTokens: 2500 });
-  t.mock.timers.tick(1000);
+  await Promise.resolve();
   assert.match(render(), /context \(min\).*200 \/ 1,000 · 20% remaining/);
   assert.match(statuses.get("kanban-usage")!, /research \$0.5000/);
   state.sessions[0].stage = "compose";
   const c = new AbortController();
   beginChildUsage(run.signal, c.signal, "compose", "compose", model);
-  t.mock.timers.tick(1000);
+  await Promise.resolve();
   assert.match(render(), /compose context.*awaiting usage/);
   assert.doesNotMatch(render(), /20% remaining/);
   reportUsage(c.signal, { contextTokens: 200, totalTokens: 200, cost: 0.1 });

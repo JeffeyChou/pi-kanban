@@ -21,10 +21,45 @@ import { createSession, mutateAsync, type Session } from "../src/store.js";
 import { readWorkfile, workfileBase, writeWorkfileSection } from "../src/workfile.js";
 import { readLoopLog, readLoopRun } from "../src/looplog.js";
 import { loopProgress } from "../src/liveprogress.js";
+import { queryStatus } from "../src/status.js";
 
 const execFileAsync = promisify(execFile);
 
 const TITLE = "Loop session";
+
+test("baseline measurement runs in the background and status queries do not wait or advance", async () => {
+  let entered!: () => void, release!: () => void;
+  const measuring = new Promise<void>((resolve) => { entered = resolve; });
+  const measurement = new Promise<void>((resolve) => { release = resolve; });
+  const harnessed = await harness({ measure: async () => {
+    entered();
+    await measurement;
+    return { validationPass: true, tail: "baseline", metric: 1, metricUnmeasured: false };
+  } });
+  let task: Promise<LoopResult> | undefined;
+  try {
+    const started = await harnessed.start();
+    assert.equal(started.armed, true, "start must resolve before the baseline does");
+    task = started.run;
+    await measuring;
+    assert.equal(hasLiveRun(TITLE), true);
+    const before = await readFile(join(harnessed.cwd, ".kanban/state.json"), "utf8");
+    const status = await queryStatus(harnessed.cwd);
+    assert.match(status, /running in the background/);
+    assert.match(status, /measuring the baseline/);
+    assert.equal(await readFile(join(harnessed.cwd, ".kanban/state.json"), "utf8"), before);
+    assert.equal(harnessed.calls.length, 0);
+    abortPipelineFor(TITLE);
+    release();
+    assert.equal((await task!).kind, "aborted");
+    assert.equal((await git(harnessed.cwd, "worktree", "list")).trim().split("\n").length, 1);
+    assert.equal((await unstagedOnly(harnessed.cwd)).unstaged, "");
+  } finally {
+    release();
+    await task;
+    await harnessed.cleanup();
+  }
+});
 
 test("live implement progress exposes the goal, output, measurements and final decision", async () => {
   const harnessed = await harness({
@@ -790,7 +825,7 @@ test("landing is refused when the session token goes stale under the loop", asyn
   }
 });
 
-test("arming is refused when a configured metric has no measurable baseline", async () => {
+test("a background task fails cleanly when its configured baseline cannot be measured", async () => {
   const harnessed = await harness({
     child: (spec) => childWrites(spec, { "app.ts": "export const value = 3;\n" }, "complete"),
   });
@@ -798,8 +833,10 @@ test("arming is refused when a configured metric has no measurable baseline", as
     const started = await harnessed.start({
       loop: loop({ metric: "echo nothing useful", metric_name: "score" }),
     });
-    assert.equal(started.armed, false);
-    assert.match((started as { message: string }).message, /baseline metric/);
+    assert.equal(started.armed, true);
+    const result = await started.run!;
+    assert.equal(result.kind, "failure");
+    assert.match(result.message!, /baseline metric/);
     assert.equal(hasLiveRun(TITLE), false);
     // A refused arming must not leave a token behind for a later run to trip over.
     assert.equal(sessionSync(harnessed.cwd)?.pipelineToken, undefined);

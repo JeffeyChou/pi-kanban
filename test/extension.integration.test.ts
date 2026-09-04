@@ -29,15 +29,16 @@ function extensionHarness() {
   const commands = new Map<string, any>();
   const listeners = new Map<string, any>();
   const followUps: string[] = [];
+  const tools = new Map<string, any>();
   let tool: any;
   const pi = {
     on: (name: string, listener: unknown) => listeners.set(name, listener),
     registerCommand: (name: string, command: unknown) => commands.set(name, command),
-    registerTool: (definition: unknown) => (tool = definition),
+    registerTool: (definition: any) => { tools.set(definition.name, definition); tool = definition; },
     sendUserMessage: (message: string) => followUps.push(message),
   };
   kanban(pi as any);
-  return { commands, followUps, listeners, tool };
+  return { commands, followUps, listeners, tool, tools };
 }
 
 function context(cwd: string, overrides: Record<string, any> = {}) {
@@ -189,6 +190,35 @@ test("progress command opens the live dashboard and displays the selected goal",
     assert.match(output, /Goal: Progress session brief/);
     assert.match(output, /Agent-owned implementation/);
     assert.equal(disposed, true);
+  } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
+test("status is a read-only on-demand tool and command, including saved experiment results", async () => {
+  const cwd = await sandbox();
+  try {
+    const harness = extensionHarness();
+    const ctx = context(cwd);
+    const statusTool = harness.tools.get("kanban_status");
+    assert(statusTool);
+    const empty = await statusTool.execute("query", {}, undefined, undefined, ctx);
+    assert.match(empty.content[0].text, /No selected/);
+    await assert.rejects(access(join(cwd, ".kanban")), "status must not initialize a board");
+    const created = await addSession(cwd, "Background work");
+    const { appendLoopLog } = await import("../src/looplog.js");
+    const { workfileBase } = await import("../src/workfile.js");
+    await appendLoopLog(cwd, workfileBase(created.value.planPath), { iteration: 1, decision: "discard", metric: 2, validation: false, failureReason: "test failed", validationTail: "failed check output", at: new Date().toISOString() });
+    const before = await readFile(join(cwd, ".kanban/state.json"), "utf8");
+    const result = await statusTool.execute("query", { view: "results", iteration: 1 }, undefined, undefined, ctx);
+    assert.match(result.content[0].text, /Iteration 1: discard/);
+    assert.match(result.content[0].text, /test failed/);
+    const output = await statusTool.execute("query", { view: "output", iteration: 1 }, undefined, undefined, ctx);
+    assert.match(output.content[0].text, /failed check output/);
+    await harness.commands.get("kanban").handler("status", ctx);
+    assert.match(ctx.notifications.at(-1)!, /Background work/);
+    assert.equal(await readFile(join(cwd, ".kanban/state.json"), "utf8"), before);
+    await assert.rejects(access(join(cwd, ".kanban/lock")));
+    assert.equal(harness.followUps.length, 0);
+    assert.equal(ctx.freshMessages.length, 0);
   } finally { await rm(cwd, { recursive: true, force: true }); }
 });
 

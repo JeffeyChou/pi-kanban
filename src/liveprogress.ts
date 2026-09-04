@@ -1,4 +1,5 @@
 import { stripVTControlCharacters } from "node:util";
+import { publishProgress } from "./progressevents.js";
 
 /** Bounded, process-local display data. Durable decisions remain in the loop log. */
 export interface LiveLoopProgress {
@@ -23,6 +24,7 @@ export interface LiveLoopProgress {
 
 const bySession = new Map<string, LiveLoopProgress>();
 const bySignal = new WeakMap<AbortSignal, LiveLoopProgress>();
+const locations = new WeakMap<LiveLoopProgress, string>();
 const key = (cwd: string, base: string) => JSON.stringify([cwd, base]);
 
 export function displayText(text: string): string {
@@ -42,6 +44,8 @@ export function beginLoopProgress(
   bySession.set(key(cwd, base), progress);
   if (bySession.size > 16) bySession.delete(bySession.keys().next().value!);
   bySignal.set(signal, progress);
+  locations.set(progress, cwd);
+  publishProgress(cwd, "live");
   signal.addEventListener("abort", () => endLoopProgress(signal, "stopped"), { once: true });
   return progress;
 }
@@ -54,6 +58,7 @@ export function updateLoopProgress(signal: AbortSignal, update: Partial<LiveLoop
   const progress = bySignal.get(signal);
   if (!progress?.active || signal.aborted) return;
   Object.assign(progress, update, { updatedAt: Date.now() });
+  publishProgress(locations.get(progress)!, "live");
 }
 
 export function appendLiveOutput(signal: AbortSignal, text: string): void {
@@ -61,6 +66,7 @@ export function appendLiveOutput(signal: AbortSignal, text: string): void {
   if (!progress?.active || signal.aborted) return;
   progress.output = (progress.output + displayText(text)).slice(-8000);
   progress.updatedAt = Date.now();
+  publishProgress(locations.get(progress)!, "live");
 }
 
 export function endLoopProgress(signal: AbortSignal, activity?: string): void {
@@ -71,4 +77,5 @@ export function endLoopProgress(signal: AbortSignal, activity?: string): void {
   if (activity) progress.activity = activity;
   progress.updatedAt = Date.now();
   bySignal.delete(signal);
+  publishProgress(locations.get(progress)!, "live");
 }

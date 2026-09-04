@@ -15,6 +15,7 @@ import { loadConfig } from "./config.js";
 import { displayText, loopProgress, type LiveLoopProgress } from "./liveprogress.js";
 import { getUsage, usageLines } from "./usage.js";
 import { readWorkfile, workfileBase } from "./workfile.js";
+import { publishProgress, subscribeProgress } from "./progressevents.js";
 
 interface LiveWidgetState {
   contextWindow: number;
@@ -62,19 +63,18 @@ function contextRow(ctx: ExtensionContext, view: WidgetSnapshot): { text: string
   };
 }
 
-/** Read-only refresh while internal children run; no state reload or write per tick. */
+/** Refresh on child usage events. A quiet run has no scheduled UI work. */
 export function startUsageDisplay(ctx: ExtensionContext, signal: AbortSignal): () => void {
   let stopped = false;
   const refresh = () => {
     const state = widgetStates.get(ctx.cwd);
     if (state) void refreshWidget(ctx, state).catch(() => {});
   };
-  const timer = setInterval(refresh, 1000);
-  timer.unref();
+  const unsubscribe = subscribeProgress(ctx.cwd, (events) => { if (events.has("usage")) refresh(); });
   const stop = () => {
     if (stopped) return;
     stopped = true;
-    clearInterval(timer);
+    unsubscribe();
     signal.removeEventListener("abort", stop);
     refresh();
   };
@@ -199,6 +199,8 @@ export async function refreshWidget(
   state: KanbanState,
 ): Promise<void> {
   widgetStates.set(ctx.cwd, state);
+  if (selectedForWidget.get(ctx.cwd) !== state.selectedSessionTitle)
+    publishProgress(ctx.cwd, "selection");
   selectedForWidget.set(ctx.cwd, state.selectedSessionTitle);
   const view = snapshot(state, liveWidgetState(ctx));
   const usage = view ? getUsage(ctx.cwd, view.title) : undefined;
@@ -268,12 +270,13 @@ export function startLoopWidget(ctx: ExtensionCommandContext, base: string, sign
       invalidate: () => {},
     }), { placement: "aboveEditor" });
   };
-  const timer = setInterval(render, 1000);
-  timer.unref();
+  const unsubscribe = subscribeProgress(ctx.cwd, (events) => {
+    if (events.has("live") || events.has("selection")) render();
+  });
   const stop = () => {
     if (stopped) return;
     stopped = true;
-    clearInterval(timer);
+    unsubscribe();
     signal.removeEventListener("abort", stop);
     if (loopWidgets.get(ctx.cwd) === stop) {
       loopWidgets.delete(ctx.cwd);
@@ -398,8 +401,7 @@ export async function showDashboard(
 
 /**
  * A live, explicit experiment table. It intentionally is not another selected-session widget
- * row: the compact four-line widget remains the low-noise board summary while this panel polls
- * the append-only durable experiment log.
+ * row: live events redraw cached data; durable iteration events reload the experiment log.
  */
 export async function showExperimentDashboard(
   ctx: ExtensionCommandContext,
@@ -417,11 +419,13 @@ export async function showExperimentDashboard(
     let records: LoopIterationRecord[] = [];
     let closed = false;
     let refreshing = false;
+    let refreshAgain = false;
     let offset = 0;
     let outputOffset = 0;
     let outputLines = 0;
     const refresh = async () => {
-      if (refreshing || closed) return;
+      if (closed) return;
+      if (refreshing) { refreshAgain = true; return; }
       refreshing = true;
       const [nextManifest, nextRecords, nextPlan] = await Promise.all([
         readLoopRun(ctx.cwd, base),
@@ -434,13 +438,18 @@ export async function showExperimentDashboard(
       records = nextRecords;
       plan = nextPlan;
       tui.requestRender();
+      if (refreshAgain) { refreshAgain = false; void refresh(); }
     };
-    const timer = setInterval(() => void refresh(), 750);
+    const unsubscribe = subscribeProgress(ctx.cwd, (events) => {
+      if (closed) return;
+      if (events.has("records")) void refresh();
+      else tui.requestRender();
+    });
     void refresh();
     const finish = () => {
       if (closed) return;
       closed = true;
-      clearInterval(timer);
+      unsubscribe();
       done(undefined);
     };
     return {
@@ -489,7 +498,8 @@ export async function showExperimentDashboard(
           live?.active ? "Live output (bounded tail):" : "Latest output (bounded tail; live text lasts for this Pi process):",
           ...output.slice(Math.max(0, outputLines - 6 - outputOffset), outputLines - outputOffset),
           "",
-          "↑/↓ attempts · PgUp/PgDn output · Esc closes · auto-refresh 0.75s",
+          "↑/↓ attempts · PgUp/PgDn output · r reloads saved results · Esc closes",
+          "Event-driven updates in this Pi process; no idle polling",
           "Stop the loop: /kanban implement stop",
         ];
         return panelLines("Kanban implement progress", rows.map(displayText), width).map((line, index) =>
@@ -497,13 +507,14 @@ export async function showExperimentDashboard(
         );
       },
       invalidate: () => {},
-      dispose: () => { closed = true; clearInterval(timer); },
+      dispose: () => { closed = true; unsubscribe(); },
       handleInput: (input) => {
         if (matchesKey(keys, input, "tui.select.cancel", ["\u001b"])) finish();
         else if (matchesKey(keys, input, "tui.select.up", ["\u001b[A", "k"])) offset = Math.min(Math.max(0, records.length - 1), offset + 1);
         else if (matchesKey(keys, input, "tui.select.down", ["\u001b[B", "j"])) offset = Math.max(0, offset - 1);
         else if (input === "\u001b[5~") outputOffset = Math.min(Math.max(0, outputLines - 6), outputOffset + 6);
         else if (input === "\u001b[6~") outputOffset = Math.max(0, outputOffset - 6);
+        else if (input.toLowerCase() === "r") void refresh();
         tui.requestRender();
       },
     };

@@ -3,6 +3,27 @@ import test from "node:test";
 import { PipelineProgress } from "../src/pipelineprogress.js";
 import { appendLiveOutput, beginLoopProgress, endLoopProgress, loopProgress, updateLoopProgress } from "../src/liveprogress.js";
 import { renderLoopProgress, refreshWidget, startLoopWidget } from "../src/ui.js";
+import { publishProgress, subscribeProgress } from "../src/progressevents.js";
+
+test("progress events coalesce notifications and schedule no work while idle", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  const batches: string[][] = [];
+  const stop = subscribeProgress("/events", (events) => batches.push([...events]));
+  publishProgress("/events", "live");
+  publishProgress("/events", "usage");
+  publishProgress("/events", "live");
+  publishProgress("/other", "records");
+  assert.equal(batches.length, 0);
+  await Promise.resolve();
+  assert.deepEqual(batches, [["live", "usage"]]);
+  t.mock.timers.tick(3_600_000);
+  await Promise.resolve();
+  assert.equal(batches.length, 1, "a quiet task must not wake observers");
+  stop();
+  publishProgress("/events", "records");
+  await Promise.resolve();
+  assert.equal(batches.length, 1);
+});
 
 test("pipeline progress counts completions, distinguishes silence, and uses only completed-run timing", () => {
   let now = 0;

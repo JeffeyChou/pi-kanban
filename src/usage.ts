@@ -1,4 +1,5 @@
 import type { Stage } from "./store.js";
+import { publishProgress } from "./progressevents.js";
 
 /** Current context is per child; billed token/cost totals span that child's requests. */
 export interface ChildUsage {
@@ -13,6 +14,7 @@ export interface ChildUsage {
 }
 
 export interface UsageRun {
+  cwd: string;
   stage?: Stage;
   active: boolean;
   children: ChildUsage[];
@@ -39,6 +41,7 @@ export function getUsage(cwd: string, title: string): UsageRun | undefined {
 export function beginUsage(cwd: string, title: string, signal: AbortSignal): void {
   const previous = getUsage(cwd, title);
   const run: UsageRun = {
+    cwd,
     active: !signal.aborted, children: [], stageCost: 0, stageTokens: 0,
     stageReports: 0, stageChildren: 0,
     totalCost: previous?.totalCost ?? 0, totalTokens: previous?.totalTokens ?? 0,
@@ -48,6 +51,7 @@ export function beginUsage(cwd: string, title: string, signal: AbortSignal): voi
   sessions.set(key(cwd, title), run);
   if (sessions.size > 16) sessions.delete(sessions.keys().next().value!);
   runs.set(signal, run);
+  publishProgress(cwd, "usage");
   signal.addEventListener("abort", () => endUsage(signal), { once: true });
 }
 
@@ -72,6 +76,7 @@ export function beginChildUsage(
   run.stageChildren++;
   run.totalChildren++;
   children.set(childSignal, { run, child });
+  publishProgress(run.cwd, "usage");
 }
 
 function nonnegative(value: unknown): value is number {
@@ -88,6 +93,7 @@ export function reportUsage(signal: AbortSignal, snapshot: {
   const target = children.get(signal);
   if (!target?.run.active || !target.child.active || signal.aborted) return;
   const { run, child } = target;
+  const before = [child.contextWindow, child.contextTokens, child.contextStale, child.totalTokens, child.cost];
   if (nonnegative(snapshot.contextWindow) && snapshot.contextWindow > 0)
     child.contextWindow = snapshot.contextWindow;
   if (snapshot.contextTokens === null) child.contextStale = true;
@@ -108,12 +114,15 @@ export function reportUsage(signal: AbortSignal, snapshot: {
     run.totalCost += delta;
     run.stageCost += delta;
   }
+  const after = [child.contextWindow, child.contextTokens, child.contextStale, child.totalTokens, child.cost];
+  if (after.some((value, index) => value !== before[index])) publishProgress(run.cwd, "usage");
 }
 
 export function finishChildUsage(signal: AbortSignal): void {
   const target = children.get(signal);
   if (target) target.child.active = false;
   children.delete(signal);
+  if (target) publishProgress(target.run.cwd, "usage");
 }
 
 export function endUsage(signal: AbortSignal): void {
@@ -123,6 +132,7 @@ export function endUsage(signal: AbortSignal): void {
     for (const child of run.children) child.active = false;
   }
   runs.delete(signal);
+  if (run) publishProgress(run.cwd, "usage");
 }
 
 export function costText(cost: number, reports: number, count: number): string {

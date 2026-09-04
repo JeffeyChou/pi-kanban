@@ -28,6 +28,21 @@ refine → research → grill → compose → implement → critique
 
 Refine, research, grill, and compose run in Kanban's own internal child sessions, one output section per stage (`.kanban/work/<base>.md`). The pipeline never switches your conversation: after compose it stops and tells you to run `/kanban open` (or press Enter on the session in `/kanban`) to start implementation in a fresh Pi conversation. If child sessions fail (no runner, model/auth problem), the session durably falls back to manual mode: you run every stage yourself in the main conversation.
 
+Grill asks up to three high-impact questions, with 2–4 concrete alternatives per question.
+Each option includes a short explanation of its trade-off, the recommendation is first, and
+**Answer differently…** is last. **Skip (record assumption)** or Escape records the recommendation
+as an assumption; headless runs do the same. Legacy children that emit only a recommendation
+still work. A stage with `Questions: none` proceeds without a question dialog.
+
+The pipeline status line refreshes every second with the current/next stage, elapsed time,
+running and finished child counts, failures, and each active child's latest activity and its age.
+An ETA range uses up to five successful runs of the same stage/model/settings in the current Pi
+process; without history it says `ETA unknown`. Human answer time is excluded from timing
+samples. Long-running stages report that the estimate is uncertain. A child wait is limited to
+five minutes by default (`pipeline.childTimeoutMs`); timeout requests cancellation and follows
+the normal child-failure path, keeping the current stage and falling back to manual mode.
+Partial research failure retains the successful workers' findings and reports missing coverage.
+
 If the repository has an executable `./init.sh`, the implement kickoff, final completion text, and handoff rules carry the auto-detected init commands (`init: { start: "auto", check: "auto" }` in config; set `null` to disable). Stage prompts and tool guidance never mention init commands.
 
 ## Commands
@@ -38,7 +53,9 @@ If the repository has an executable `./init.sh`, the implement kickoff, final co
 | `/kanban create <prompt>` | Generates a title, creates/selects the durable pipeline-mode session, and starts the pipeline. |
 | `/kanban open [title]` | No title means the selected session. At implement/critique it opens a clean Pi conversation seeded with plan, handoff, and workfile spec; on a pipeline-owned stage it re-runs that stage's child (blocked sessions are refused with a notify). Also aborts any live pipeline run for that title before minting a fresh token. |
 | `/kanban implement` | Valid only at the implement stage. With `loop.enabled` it starts the orchestrator-owned implement loop (below); with the default `loop.enabled: false` it opens the agent-owned implement conversation exactly like `/kanban open`. `/kanban implement stop` aborts a live loop without landing anything. |
-| `/kanban experiments` | Opens the selected session's live autoresearch table: branch, baseline/best metric, keep/revert history, validation state, commits, and rationales. |
+| `/kanban status [summary\|output\|results\|plan]` | Reads one snapshot without opening a dashboard, joining the background task, or changing state. Defaults to summary. |
+| `/kanban progress` / `/kanban experiments` | Opens the selected session's implement dashboard: goal, current activity, public child/measurement output, baseline/latest/best/target metric, recent metric trend, keep/revert history, validation, commits, and comments. ↑/↓ browses attempts; PgUp/PgDn scrolls the retained output; Escape closes the panel without stopping the loop. Agent-owned implementation shows saved checkpoints and its roster. |
+| `/kanban plan` | Opens a read-only, scrollable preview of the composed Markdown implementation plan without switching conversations. ↑/↓ scrolls; PgUp/PgDn pages; Escape closes. |
 | `/kanban config` | Opens `.kanban/config.json` in the editor (created if missing). |
 | `/kanban pause` / `/kanban unpause` | Marks the currently selected session `blocked` or `active` without changing its stage. Pausing also aborts a live pipeline run and clears its token; unpausing restarts nothing. |
 | `/kanban remove` | Permanently deletes the currently selected session, its plan, and its workfile after confirmation (a live run is aborted first). |
@@ -54,7 +71,9 @@ The dashboard is rendered as a bordered editor-area panel, not a floating transc
 {
   "models": { "refine": null, "research": null, "grill": null, "compose": null,
               "critique": null },          // "provider:model-id" or null → parent model
-  "research": { "workers": 3 },           // 1–3 parallel research workers
+  "research": { "workers": 2, "depth": "focused" }, // workers: 1–3; depth: focused | deep
+  "compose": { "detail": "plan" },         // plan | concise | detailed
+  "pipeline": { "childTimeoutMs": 300000 }, // per refine/research/grill/compose child, 1s–1h
   "fastPath": true,                        // refine "simple" verdict skips research + grill
   "critique": true,                        // false ⇒ critique completes without a gate
   "runner": "auto",                       // auto | inprocess | subprocess
@@ -86,10 +105,34 @@ Both commands inherit the environment of the shell that started Pi — that is h
 
 Each stage (and research worker) uses its configured model when set; otherwise the parent session model. Installed external subagent/background-task tools are detected and named in the implement kickoff — they are never invoked by Kanban.
 
+Research always covers repository conventions, affected code facts, and validation. With one
+worker it combines all three; with two, one covers conventions/code and the other validation;
+with three, each has one angle. `focused` aims for six targeted tool calls and 35 output lines
+per angle; `deep` also traces relevant dependencies and edge cases, within 70 lines per angle.
+These are prompt budgets, not enforced tool-call quotas. Grill reuses those findings and aims
+for at most three targeted reads. Compose defaults to a reviewable Markdown implementation plan
+with summary, goals/non-goals, proposed approach, ordered implementation steps, validation and
+acceptance, and risks/assumptions. It uses the user's language, preserves settled decisions, and
+connects each step to relevant paths, dependencies and verification. The **entire compose section,
+including its heading, must fit within 300 physical lines**. Substantial requests usually need
+120–240 lines; small requests should stay shorter. `concise` retains a 100-line prompt budget and
+`detailed` a 220-line budget, with the same plan structure. An oversized compose result stays at
+compose and falls back to manual mode; it is never published as a truncated implementation plan.
+Use `/kanban plan` to review it before `/kanban open`. Explicit existing settings are preserved;
+new defaults do not override repository/global choices.
+
 ## The implement loop (opt-in)
 
 With `loop.enabled`, `/kanban implement` hands the implement stage to the orchestrator as an
 iterative experiment loop instead of running it in your conversation:
+
+In interactive and RPC modes it returns after preflight and task registration. Baseline measurement
+also runs in the background, so a slow baseline does not occupy the command. The controller awaits
+child/process promises and consumes no model turns to monitor progress. The main conversation stays
+available for questions; completing/failing the task produces a notification. Background execution
+is owned by the current Pi process, not a detached service: shutdown/reload still stops it, and
+single-shot modes await completion as described below. `loop.enabled: false` retains the normal
+agent-owned implementation conversation.
 
 1. **Preflight.** It refuses without a fitness signal (`loop.validate` or `loop.metric`), with
    modified tracked files in your working tree (commit or stash first; untracked files are left
@@ -136,10 +179,40 @@ accepted experiment paths and suggests the commit message; it never commits the 
 Kanban cannot lock your git working tree, so landing re-checks HEAD, cleanliness and the session
 token immediately before applying; a patch that no longer applies leaves your tree untouched.
 
-Progress appears on the status line; `/kanban experiments` opens a live, auto-refreshing iteration
-table without expanding the compact selected-session widget. `/kanban implement stop`,
+While a loop runs, a separate implement progress widget appears above the editor, alongside the
+unchanged four-row board widget. It displays the goal, iteration budget, actual running child
+count, elapsed time, baseline/latest/best/target, current activity, the latest decision comment,
+and the last output line. It hides when a different session is selected and clears after the
+run ends. Iterations are an attempt budget, not a claim about percentage of the goal completed.
+
+`/kanban progress` (also `/kanban experiments`) opens the larger event-driven dashboard.
+Public assistant text streams during the child run; validation and metric stdout/stderr stream
+during measurement. The child count becomes zero while measuring. The output tail is capped
+at 8,000 characters in memory, with terminal control sequences stripped; it is neither a full
+transcript nor a reasoning trace. Another Pi process, or a restarted one, sees the durable
+iteration records and saved validation tails but has no live telemetry for the previous process.
+With `loop.enabled: false`, implementation runs in the main Pi conversation: the dashboard
+shows checkpoint summaries/agents, and third-party child output remains in its own scheduler.
+
+The implement widget and usage display subscribe to task events. The dashboard redraws live data
+when output/usage changes and reloads saved records at iteration boundaries; it does no periodic
+file polling. Quiet periods schedule no observer work, so elapsed/last-activity labels update on
+the next event, interaction or query. Press `r` to reload saved records manually, including changes
+made by another Pi process. Closing the dashboard removes its subscriptions and leaves the task running.
+
+You can ask the main agent "what is it doing?" or "why was iteration 3 discarded?". The read-only
+`kanban_status` tool supplies a bounded `summary`, `output`, `results`, or `plan` snapshot, with an
+optional completed iteration number. It neither waits for completion nor advances, resumes, or
+restarts work. The tool instructs the agent to query on demand and answer, without a monitoring
+loop. `/kanban status`, `/kanban status output`, and `/kanban status results` offer the same views
+directly. Live output remains a bounded process-local tail; saved results are not full transcripts.
+
+`/kanban implement stop`,
 `/kanban pause`, `/kanban remove`, `/kanban open` and Pi shutdown all abort a live loop, and an
 aborted loop lands nothing.
+
+`pipeline.childTimeoutMs` applies only to planning children. It does not shorten implement
+iterations or the explicitly configured `loop.measureTimeoutMs` for expensive measurements.
 
 ## Unattended runs
 
@@ -184,7 +257,28 @@ The task-style widget above Pi's editor intentionally shows only four things:
   ● Agents working 2
 ```
 
-Context capacity comes directly from Pi's active model and context-usage APIs. This row belongs to the **current Pi conversation**, not the selected Kanban session. It no longer requires a manually configured model limit and does not display `unavailable`; immediately after compaction it uses the last known token usage for that Pi conversation, or zero if none exists yet.
+Context follows the executor. During a live internal stage (including the implement loop and
+critique gate), this row names the stage and shows that child's remaining context. Parallel
+research workers have independent windows: the compact row shows the lowest remaining percentage
+among workers with usage data, marking any workers still awaiting usage. `/kanban progress`
+lists each child's model, capacity, remaining tokens and reported cost. After the internal run
+ends, or during agent-owned work, the row returns to **Current Pi context** for the main conversation.
+
+Capacity comes from each child's resolved Pi model; in-process context comes from Pi's context
+API, while subprocess context uses the latest assistant usage report including cache tokens.
+These are estimates, not a per-token meter. The widget refreshes when usage changes;
+provider token/cost reports usually arrive at response boundaries. A new child says
+`awaiting usage` until data arrives. After child compaction it marks retained usage as last known
+until the next sample. There are no user-maintained model limits and no `unavailable` label.
+
+Pi's native cost footer still accounts for its main conversation only. Kanban adds a separate
+**Child cost estimate** status line showing current-stage cost and the tracked child total for
+the selected title in this Pi process. Repeated SDK snapshots do not double-count requests;
+cached tokens count toward cumulative usage, not a combined context window. These figures come
+from Pi/provider usage and pricing, not an invoice or subscription balance. Missing reports are
+marked explicitly; zero reported cost can reflect provider pricing configuration. Totals exclude
+main-conversation work, title generation and third-party children, survive stage/iteration changes,
+and reset on Pi reload/restart (up to sixteen recently tracked titles are retained in memory).
 
 ## Durable files
 
