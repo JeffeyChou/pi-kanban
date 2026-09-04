@@ -19,6 +19,7 @@ import { abortPipelineFor, clearPipelineRegistry, hasLiveRun } from "../src/orch
 import type { ChildResult, ChildSpec } from "../src/runner.js";
 import { createSession, mutateAsync, type Session } from "../src/store.js";
 import { readWorkfile, workfileBase, writeWorkfileSection } from "../src/workfile.js";
+import { readLoopLog, readLoopRun } from "../src/looplog.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -61,6 +62,16 @@ function config(overrides: Partial<KanbanConfig> = {}): KanbanConfig {
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await execFileAsync("git", args, { cwd, maxBuffer: 8 * 1024 * 1024 });
   return stdout;
+}
+
+/** Exit-code probe: true when the git command exits nonzero (an absent object, say). */
+async function gitFails(cwd: string, ...args: string[]): Promise<boolean> {
+  try {
+    await execFileAsync("git", args, { cwd });
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 function sessionSync(cwd: string, title = TITLE): Session | undefined {
@@ -216,8 +227,12 @@ test("a complete iteration lands unstaged and advances the session to critique",
     const diff = await unstagedOnly(harnessed.cwd);
     assert.match(diff.unstaged, /value = 2/);
     assert.equal(diff.staged, "", "the loop must never stage anything");
-    assert.equal(await harnessed.head(), head, "the loop must never commit");
+    assert.equal(await harnessed.head(), head, "the loop must never commit the user checkout");
     assert.equal(sessionSync(harnessed.cwd)?.stage, "critique");
+    const run = await readLoopRun(harnessed.cwd, harnessed.base);
+    assert.equal(run?.status, "success");
+    assert.match(run?.branch ?? "", /^kanban-autoresearch\//);
+    assert.notEqual(run?.bestCommit, head, "a kept candidate is committed only on the private branch");
     assert.equal(hasLiveRun(TITLE), false, "the run unregisters itself");
     assert.match(
       harnessed.notifications.map((entry) => entry.message).join("\n"),
@@ -267,15 +282,14 @@ test("a failed validation discards the iteration and its files never land", asyn
     assert.equal(existsSync(join(harnessed.cwd, "broken.ts")), false);
     assert.equal(diff.staged, "");
 
-    // A successful advance deletes the loop breadcrumbs; the durable record of what the loop
-    // tried is the `## implement` workfile section the advancing commit wrote.
+    // A successful advance preserves the durable experiment history as the resume/audit source.
     const section = (await readWorkfile(harnessed.cwd, harnessed.base)).sections.implement ?? "";
     assert.match(section, /1\. discard/);
     assert.match(section, /bad edit/);
     assert.match(section, /2\. keep/);
     assert.equal(
       existsSync(join(harnessed.cwd, ".kanban", "loop", `${harnessed.base}.jsonl`)),
-      false,
+      true,
     );
   } finally {
     await harnessed.cleanup();
@@ -426,7 +440,7 @@ test("a metric keeps only strict improvements and honours the target", async () 
     const section = (await readWorkfile(harnessed.cwd, harnessed.base)).sections.implement ?? "";
     assert.match(section, /1\. discard/);
     assert.match(section, /did not improve/);
-    assert.match(section, /2\. keep metric 5/);
+    assert.match(section, /2\. keep \(agent: keep\) metric 5/);
     assert.match(await readFile(join(harnessed.cwd, "score.txt"), "utf8"), /5/);
   } finally {
     await harnessed.cleanup();
@@ -813,6 +827,111 @@ test("loop progress is reported on the status line", async () => {
     assert.ok(lines.some((line) => /iteration 1\/3/.test(line)));
     // The status line is cleared when the run releases.
     assert.equal(harnessed.statuses.at(-1), undefined);
+  } finally {
+    await harnessed.cleanup();
+  }
+});
+
+test("a configured baseline metric is trusted instead of measured", async () => {
+  const measured: string[] = [];
+  const harnessed = await harness({
+    child: (spec) => childWrites(spec, { "app.ts": "export const value = 9;\n" }, "complete"),
+    measure: async (cwd) => {
+      measured.push(cwd);
+      return { validationPass: true, tail: "", metric: 9, metricUnmeasured: false };
+    },
+  });
+  try {
+    const started = await harnessed.start({
+      loop: loop({
+        validate: undefined,
+        metric: "echo METRIC score=9",
+        metric_name: "score",
+        baselineMetric: 1,
+        target: 9,
+      }),
+    });
+    assert.equal(started.armed, true);
+    const result = await (started as { run: Promise<LoopResult> }).run;
+
+    assert.equal(result.kind, "success");
+    assert.equal(measured.length, 1, "only the iteration is measured; the baseline is not");
+    assert.match(measured[0], /worktrees\/.+\/1$/, "the single measurement is iteration 1's");
+    const run = await readLoopRun(harnessed.cwd, harnessed.base);
+    assert.equal(run?.baselineMetric, 1);
+    assert.match(
+      harnessed.statuses.filter(Boolean).join("\n"),
+      /baseline 1 taken from config/,
+    );
+  } finally {
+    await harnessed.cleanup();
+  }
+});
+
+test("the audit ref keeps every attempt and its evidence while the accepted commit stays clean", async () => {
+  const harnessed = await harness({
+    // `evidence/` is ignored, so it can only reach Git through the audit ref's force-add.
+    committed: { ".gitignore": ".kanban/\nevidence/\n" },
+    child: async (spec, iteration) => {
+      await childWrites(spec, { "app.ts": `export const value = ${iteration + 1};\n` }, "continue");
+      // The second attempt asks to be reverted, so the audit ref has to hold a discard too.
+      return {
+        text:
+          iteration === 2
+            ? "Status: continue\nDecision: revert\nRationale: regressed"
+            : "Status: continue\nDecision: keep\nRationale: raised value",
+        aborted: false,
+      };
+    },
+    measure: async (cwd) => {
+      // Stand in for a gate that submits external work and writes back what it observed.
+      await mkdir(join(cwd, "evidence"), { recursive: true });
+      await writeFile(join(cwd, "evidence", "gate.log"), `attempt observed in ${cwd}\n`, "utf8");
+      return { validationPass: true, tail: "", metric: 1, metricUnmeasured: false };
+    },
+  });
+  try {
+    const started = await harnessed.start({
+      loop: loop({
+        maxIterations: 2,
+        decisionPolicy: "agent-with-validation",
+        audit: true,
+        auditPaths: ["evidence"],
+      }),
+    });
+    const result = await (started as { run: Promise<LoopResult> }).run;
+    assert.equal(result.iterations, 2);
+
+    const run = await readLoopRun(harnessed.cwd, harnessed.base);
+    const auditRef = run?.auditRef ?? "";
+    assert.equal(auditRef, `kanban-audit/${harnessed.base}`);
+    const head = (await git(harnessed.cwd, "rev-parse", "HEAD")).trim();
+    assert.equal(
+      (await git(harnessed.cwd, "rev-list", "--count", `${head}..${auditRef}`)).trim(),
+      "2",
+      "one audit commit per attempt, kept and discarded alike",
+    );
+
+    const records = await readLoopLog(harnessed.cwd, harnessed.base);
+    assert.deepEqual(
+      records.map((record) => record.decision),
+      ["keep", "discard"],
+    );
+    for (const record of records) {
+      assert.ok(record.auditCommit, `iteration ${record.iteration} records its audit commit`);
+      assert.match(
+        await git(harnessed.cwd, "show", `${record.auditCommit}:evidence/gate.log`),
+        /attempt observed in/,
+        "the disposable worktree's evidence survives in the audit commit",
+      );
+    }
+
+    assert.equal(
+      await gitFails(harnessed.cwd, "cat-file", "-e", `${run?.bestCommit}:evidence/gate.log`),
+      true,
+      "the accepted experiment commit carries no evidence",
+    );
+    assert.equal(existsSync(join(harnessed.cwd, "evidence")), false, "and neither does the checkout");
   } finally {
     await harnessed.cleanup();
   }

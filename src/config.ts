@@ -35,14 +35,40 @@ export interface LoopConfig {
   /** Name matched in the `METRIC <name>=<value>` line; defaults to any name. */
   metric_name?: string;
   direction: "higher" | "lower";
+  /**
+   * `strict-metric` preserves the original optimizer rule. In
+   * `agent-with-validation`, the fresh iteration agent chooses keep/revert but
+   * a failed validation or an unmeasured configured metric still cannot land.
+   */
+  decisionPolicy: "strict-metric" | "agent-with-validation";
   /** Metric value at which a `complete` iteration counts as SUCCESS. */
   target?: number;
+  /**
+   * Already-known baseline metric. When set, the loop trusts it and skips measuring the
+   * baseline. This exists for measurements that cost hours of wall-clock or a scheduler
+   * allocation: re-deriving a value that is already recorded evidence is pure waste.
+   */
+  baselineMetric?: number;
   maxIterations: number;
   /** Stop after this many consecutive discards. */
   noImprovementStreak: number;
   measureTimeoutMs: number;
   /** Opt-in `.kanban/hooks/{before,after}-iteration` execution. */
   hooks: boolean;
+  /**
+   * Write one commit per iteration — kept OR discarded — to the separate `kanban-audit/<base>`
+   * ref. Iteration worktrees are disposable, so this is the only way evidence produced by a
+   * measurement survives. It never touches the accepted-experiment branch.
+   */
+  audit: boolean;
+  /**
+   * Pathspecs force-added into each audit commit. Evidence written under a gitignored path
+   * therefore reaches the audit ref while staying out of the accepted commit and the landed
+   * patch. Requires `audit`.
+   */
+  auditPaths?: string[];
+  /** Resume an interrupted durable experiment when the session opens. */
+  autoResume: boolean;
 }
 
 export interface KanbanConfig {
@@ -116,19 +142,29 @@ const DirectionSchema = Type.Union([
   Type.Literal("higher"),
   Type.Literal("lower"),
 ]);
+const DecisionPolicySchema = Type.Union([
+  Type.Literal("strict-metric"),
+  Type.Literal("agent-with-validation"),
+]);
 const PositiveIntegerSchema = Type.Integer({ minimum: 1 });
 const FiniteNumberSchema = Type.Number();
+const PathListSchema = Type.Array(Type.String({ minLength: 1 }), { minItems: 1 });
 const LoopValueSchemas = {
   enabled: BooleanSchema,
   validate: StringSchema,
   metric: StringSchema,
   metric_name: StringSchema,
   direction: DirectionSchema,
+  decisionPolicy: DecisionPolicySchema,
   target: FiniteNumberSchema,
+  baselineMetric: FiniteNumberSchema,
   maxIterations: PositiveIntegerSchema,
   noImprovementStreak: PositiveIntegerSchema,
   measureTimeoutMs: PositiveIntegerSchema,
   hooks: BooleanSchema,
+  audit: BooleanSchema,
+  auditPaths: PathListSchema,
+  autoResume: BooleanSchema,
 } as const;
 const LoopKeys = Object.keys(LoopValueSchemas) as Array<keyof LoopConfig>;
 const LoopSchema = Type.Object(
@@ -138,11 +174,16 @@ const LoopSchema = Type.Object(
     metric: Type.Optional(StringSchema),
     metric_name: Type.Optional(StringSchema),
     direction: DirectionSchema,
+    decisionPolicy: DecisionPolicySchema,
     target: Type.Optional(FiniteNumberSchema),
+    baselineMetric: Type.Optional(FiniteNumberSchema),
     maxIterations: PositiveIntegerSchema,
     noImprovementStreak: PositiveIntegerSchema,
     measureTimeoutMs: PositiveIntegerSchema,
     hooks: BooleanSchema,
+    audit: BooleanSchema,
+    auditPaths: Type.Optional(PathListSchema),
+    autoResume: BooleanSchema,
   },
   { additionalProperties: false },
 );
@@ -186,10 +227,13 @@ const defaults: RawConfig = {
   loop: {
     enabled: false,
     direction: "higher",
-    maxIterations: 10,
-    noImprovementStreak: 3,
+    decisionPolicy: "agent-with-validation",
+    maxIterations: 50,
+    noImprovementStreak: 8,
     measureTimeoutMs: 300_000,
     hooks: false,
+    audit: false,
+    autoResume: false,
   },
 };
 
@@ -314,7 +358,8 @@ function configLayer(
         // higher-precedence layer silently erase a command. Users remove the key instead.
         if (
           !Value.Check(LoopValueSchemas[typedKey], loopValue) ||
-          (typedKey === "target" && !Number.isFinite(loopValue))
+          ((typedKey === "target" || typedKey === "baselineMetric") &&
+            !Number.isFinite(loopValue))
         ) {
           invalid(warnings, `${source}.loop`, loopKey);
           continue;

@@ -38,6 +38,7 @@ If the repository has an executable `./init.sh`, the implement kickoff, final co
 | `/kanban create <prompt>` | Generates a title, creates/selects the durable pipeline-mode session, and starts the pipeline. |
 | `/kanban open [title]` | No title means the selected session. At implement/critique it opens a clean Pi conversation seeded with plan, handoff, and workfile spec; on a pipeline-owned stage it re-runs that stage's child (blocked sessions are refused with a notify). Also aborts any live pipeline run for that title before minting a fresh token. |
 | `/kanban implement` | Valid only at the implement stage. With `loop.enabled` it starts the orchestrator-owned implement loop (below); with the default `loop.enabled: false` it opens the agent-owned implement conversation exactly like `/kanban open`. `/kanban implement stop` aborts a live loop without landing anything. |
+| `/kanban experiments` | Opens the selected session's live autoresearch table: branch, baseline/best metric, keep/revert history, validation state, commits, and rationales. |
 | `/kanban config` | Opens `.kanban/config.json` in the editor (created if missing). |
 | `/kanban pause` / `/kanban unpause` | Marks the currently selected session `blocked` or `active` without changing its stage. Pausing also aborts a live pipeline run and clears its token; unpausing restarts nothing. |
 | `/kanban remove` | Permanently deletes the currently selected session, its plan, and its workfile after confirmation (a live run is aborted first). |
@@ -63,17 +64,25 @@ The dashboard is rendered as a bordered editor-area panel, not a floating transc
     "enabled": false,
     "validate": "npm test",                // exit 0 ⇒ the iteration validated (fitness)
     "direction": "higher",                 // higher | lower is better
-    "maxIterations": 10,
-    "noImprovementStreak": 3,              // stop after this many consecutive discards
-    "measureTimeoutMs": 300000,
-    "hooks": false                         // run .kanban/hooks/{before,after}-iteration
+    "decisionPolicy": "agent-with-validation", // strict-metric | agent-with-validation
+    "maxIterations": 50,
+    "noImprovementStreak": 8,              // stop after this many consecutive reverts
+    "measureTimeoutMs": 300000,            // per command; covers the whole wait, so size it
+                                           // for the slowest measurement, not the fast path
+    "hooks": false,                        // run .kanban/hooks/{before,after}-iteration
+    "audit": false,                        // one kanban-audit/<base> commit per attempt
+    "autoResume": false                    // resume a paused experiment on /kanban open
     // optional, omit rather than null (the loop block rejects null):
-    //   "metric": "…prints METRIC <name>=<value>", "metric_name": "score", "target": 100
+    //   "metric": "…prints METRIC <name>=<value>", "metric_name": "score", "target": 100,
+    //   "baselineMetric": 0,               // trust this instead of measuring the baseline
+    //   "auditPaths": ["evidence"]         // force-added into each audit commit
   }
 }
 ```
 
 `models.implement` is used by the implement loop's iteration children. `loop.validate` and `loop.metric` are the only commands Kanban executes on your behalf — plus `.kanban/hooks/{before,after}-iteration` when you set `loop.hooks`. All of them are opt-in, they run only inside a disposable iteration worktree, and they are never aliased from `init.*`: Kanban never runs an init command itself.
+
+Both commands inherit the environment of the shell that started Pi — that is how a site profile, module paths or credentials reach them — and Kanban adds `KANBAN_ITERATION`, `KANBAN_MAX_ITERATIONS`, `KANBAN_BASE` and, once known, `KANBAN_BEST_METRIC`. Note that `loop.metric` runs even when `loop.validate` failed: a check whose only job is to stop an expensive measurement has to live inside the measuring command.
 
 Each stage (and research worker) uses its configured model when set; otherwise the parent session model. Installed external subagent/background-task tools are detected and named in the implement kickoff — they are never invoked by Kanban.
 
@@ -85,30 +94,71 @@ iterative experiment loop instead of running it in your conversation:
 1. **Preflight.** It refuses without a fitness signal (`loop.validate` or `loop.metric`), with
    modified tracked files in your working tree (commit or stash first; untracked files are left
    alone), or while another Kanban run is live. It records `baseCommit = HEAD` and measures a
-   baseline in a throwaway worktree.
+   baseline in a throwaway worktree — unless `loop.baselineMetric` supplies it, which is the
+   right choice when one measurement costs hours or a scheduler allocation and its current
+   value is already recorded evidence.
 2. **Each iteration** runs in its own detached `git worktree` under `.kanban/worktrees/<base>/`,
    seeded with the best result so far. An implement child session works there with
    `read/grep/find/ls/edit/write` — deliberately **no shell**, so it cannot run commands or git.
-3. **Fitness is decided by Kanban, not the child.** The candidate patch is captured *before*
+3. **Every iteration is a durable experiment.** The candidate patch is captured *before*
    measuring (so build debris never enters it), then `loop.validate` and `loop.metric` run in the
-   worktree in their own process group, killed as a group on timeout or abort. The iteration is
-   KEPT when validation passes and — if a metric is configured — the metric strictly improves;
-   otherwise it is DISCARDED and only its lesson survives, injected into the next prompt.
+   worktree in their own process group, killed as a group on timeout or abort. The child emits
+   `Decision: keep|revert`; Kanban always rejects failed validation or an unmeasured configured
+   metric, then either enforces strict improvement (`strict-metric`) or honors the agent's decision
+   (`agent-with-validation`). Keeps are committed to `kanban-autoresearch/<base>`; reverts retain
+   only their metric, rationale, and lesson in the durable log.
 4. **Termination.** A kept iteration whose child ends with `Status: complete` (and, with a metric,
    reaches `loop.target`) is a SUCCESS: the patch lands and the session advances to critique. Out
    of iterations or out of improvements is EXHAUSTED: the partial best lands but the stage stays at
    implement, and you continue with `/kanban open`. Nothing kept at all is a FAILURE: nothing
    lands, and the lessons stay in `.kanban/loop/<base>.md`.
 
-The loop is **commit-free and stage-free**: the best result is a saved patch, and landing is
-`git apply` into your working tree — **uncommitted and unstaged**, exactly like an agent's own
-edits. Kanban cannot lock your git working tree, so landing re-checks HEAD, cleanliness and the
-session token immediately before applying; a patch that no longer applies leaves your tree
-untouched and tells you where the patch file is.
+### Keeping evidence a discarded iteration produced
 
-Progress appears on the status line, never as a fifth widget row. `/kanban implement stop`,
+Iteration worktrees are disposable, so anything a measurement writes into one is gone when the
+iteration ends — and for a measurement you cannot cheaply repeat (a scheduler job log, a
+captured run directory), the discarded attempts are usually the ones worth keeping.
+
+`loop.audit` writes one commit per attempt — kept **and** discarded — to the separate
+`kanban-audit/<base>` ref, holding that attempt's tree. `loop.auditPaths` pathspecs are
+force-added, so evidence under a gitignored path reaches the audit ref while staying out of the
+accepted commit and out of the landed patch. Each `.kanban/loop/<base>.jsonl` record carries its
+`auditCommit`, so a long-swept iteration is still `git show`-able. The audit ref is never the
+accepted-experiment branch, it is never checked out, and Kanban never deletes it — `git
+branch -D kanban-audit/<base>` is yours to run when the trail has served its purpose.
+
+### Landing
+
+The loop uses a **private committed experiment branch** and a saved patch. Only accepted
+candidates are committed, and only in `kanban-autoresearch/<base>`. Its final diff lands with
+`git apply` into your working tree, still uncommitted. At final completion Kanban stages only the
+accepted experiment paths and suggests the commit message; it never commits the user checkout.
+Kanban cannot lock your git working tree, so landing re-checks HEAD, cleanliness and the session
+token immediately before applying; a patch that no longer applies leaves your tree untouched.
+
+Progress appears on the status line; `/kanban experiments` opens a live, auto-refreshing iteration
+table without expanding the compact selected-session widget. `/kanban implement stop`,
 `/kanban pause`, `/kanban remove`, `/kanban open` and Pi shutdown all abort a live loop, and an
 aborted loop lands nothing.
+
+## Unattended runs
+
+Pi's single-shot modes (`--print`, `--mode json`) execute extension commands, so the loop has a
+headless entry point:
+
+```sh
+cd /path/to/repo
+nohup pi -p "/kanban implement" > loop.log 2>&1 &
+```
+
+In those modes `/kanban implement` and `/kanban create` **block until the run finishes**, because
+print mode disposes the runtime as soon as the command returns and would otherwise kill a loop it
+had only armed. In `tui` and `rpc` mode both commands stay non-blocking, exactly as before.
+
+`/kanban implement` is valid only at the implement stage, so an unattended campaign is two steps:
+run the pipeline first (interactively, or `pi -p "/kanban create <brief>"`), then start the loop.
+A killed Pi loses nothing durable: `.kanban/loop/<base>.run.json` holds the recovery point and
+`loop.autoResume` picks it up on the next `/kanban open`.
 
 ## Low-noise checkpoints
 
@@ -143,7 +193,7 @@ Context capacity comes directly from Pi's active model and context-usage APIs. T
 - `state.json` — schema v4 canonical core state: selected unfinished session, stage, `mode`, agent names/roles/statuses, and timestamps. It never stores Pi conversation paths.
 - `plans/YYYY-MM-DD-safe-title.json` — compact, reviewable session detail: prompt, scope boundaries, agents, work summary, status, and timestamps. Completed session plans remain here; the only review data a plan carries is the bounded archive-time `completion` record.
 - `work/<base>.md` — the workfile: one `## <stage>` section per pipeline stage (each capped at 300 lines), written only by the orchestrator/critique tool inside the locked commit; resume authority is `state.json`'s stage only. Deleted at completion and `/kanban remove`; orphans are swept at startup.
-- `loop/<base>.{jsonl,md,patch,landed}` — implement-loop breadcrumbs: the per-iteration record, the bounded living summary injected into the next iteration, the best-so-far patch (so a failed landing is always recoverable), and the atomic landed marker that stops a re-run from applying the same patch twice. Deleted after a successful advance and at `/kanban remove`; kept after EXHAUSTED/FAILURE so you can read the lessons.
+- `loop/<base>.{run.json,jsonl,md,patch,landed}` — durable autoresearch record: the branch/base/best-commit recovery point (plus the audit ref and its tip when `loop.audit` is on), append-only per-iteration metric/decision/audit-commit history, bounded living summary injected into each new agent, best patch, and landed marker. It survives completion, abort, exhaustion, and restart; `/kanban remove` deletes it. The Git refs it names — `kanban-autoresearch/<base>` and `kanban-audit/<base>` — are not deleted with it.
 - `worktrees/<base>/` — disposable iteration worktrees plus a `manifest.json` recording each worktree's owner PID. Startup removes only the worktrees whose owner process is gone, so a second Pi process never sweeps a live loop's worktrees.
 - `hooks/{before,after}-iteration` — optional, executable, off unless `loop.hooks`; JSON on stdin, ≤8KB of stdout injected into the next prompt, 30s timeout, exit 10 stops the loop.
 - `config.json` — repository config override (see above).

@@ -80,7 +80,7 @@ Stages are a communication and review structure. In pipeline mode, stages `refin
 | `research` | pipeline (N parallel child workers) | Verify repository facts, relevant APIs, and external constraints; one angle per worker. |
 | `grill` | pipeline child + orchestrator Q&A | Challenge assumptions, failure modes, compatibility, and safety; open questions answered or assumed. |
 | `compose` | pipeline child | Produce a decision-complete implementation spec (`## compose`). |
-| `implement` | main conversation, or the loop when `config.loop.enabled` | Execute the spec and validate the agreed change; the workfile spec and plan are the authority. With the loop enabled, `/kanban implement` runs the stage as orchestrator-owned iterations in disposable git worktrees and lands the winner as uncommitted, unstaged changes. |
+| `implement` | main conversation, or the loop when `config.loop.enabled` | Execute the spec and validate the agreed change; the workfile spec and plan are the authority. With the loop enabled, `/kanban implement` runs autoresearch iterations in disposable git worktrees: accepted candidates are committed on `kanban-autoresearch/<base>`, reverted candidates leave durable lessons, and the final branch diff lands uncommitted in the user checkout for critique. |
 | `critique` | main conversation + gate child | Independently inspect the result and final validation evidence against the spec; see the critique gate below. |
 
 Only use `stage_complete` after the current outcome is actually met. Kanban does not independently prove that tests passed, required reviews happened, or external agents finished; that remains the active agent's responsibility.

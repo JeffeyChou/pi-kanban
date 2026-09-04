@@ -26,10 +26,10 @@ Kanban never invokes third-party subagent/background-task tools. Installed tools
 | `src/store.ts` | `.kanban/state.json` | Locked atomic v4 state; v1/v2/v3 migration; session modes and pipeline tokens | Store work-item detail, evidence, source lists, model limits, Pi conversation paths, or completed sessions |
 | `src/artifacts.ts` | Existing plan/handoff | Atomic compact plan JSON (plus the bounded archive-time `completion` record) and one bounded handoff | Duplicate state fields into the handoff or accumulate review archives |
 | `src/orchestrator.ts` | State, workfile, config, prompt grammar | Child sessions, title-keyed abort registry, locked one-stage commits, workfile sections, the implement-loop run handle | Run children under the lock, auto-switch conversations, or commit without token revalidation |
-| `src/implementloop.ts` | Config `loop`, plan prompt, workfile `## compose`, loop breadcrumbs | Iteration worktrees, iteration records, the best-so-far patch, the landed marker, one locked implement→critique commit | Run `git add`/`git commit`, stage anything, measure before capturing the candidate, land without re-checking HEAD/cleanliness/token, or treat the baseline as a success |
-| `src/worktree.ts` | Repository git state | Detached worktrees, patches captured and applied without the index | Touch the index or HEAD, or shell-interpolate a path |
-| `src/measure.ts` | The opt-in `loop.validate`/`loop.metric` commands | Nothing durable; a `MeasureOutcome` | Throw, run git, write files, or leave a process group alive after a timeout |
-| `src/looplog.ts` | `.kanban/loop/*`, `.kanban/worktrees/*/manifest.json` | Per-base iteration log, living summary, best patch, landed marker, worktree manifest | Use a shared global path or sweep a worktree whose owner PID is alive |
+| `src/implementloop.ts` | Config `loop`, plan prompt, workfile `## compose`, loop breadcrumbs | Private `kanban-autoresearch/<base>` commits for accepted candidates, durable run/history records, final patch landing, one locked implement→critique commit | Stage or commit the user's checkout; commit a failed/unmeasured/reverted candidate; measure before capturing the candidate; land without re-checking HEAD/cleanliness/token; or treat the baseline as a success |
+| `src/worktree.ts` | Repository git state | Detached worktrees, private experiment refs/commits, per-attempt `kanban-audit/<base>` snapshots, patches captured and applied without the index, experiment-path staging | Touch the user's checkout's index or HEAD from an iteration, shell-interpolate a path, move HEAD or the experiment branch from an audit write, or commit an accepted candidate outside `kanban-autoresearch/<base>` |
+| `src/measure.ts` | The opt-in `loop.validate`/`loop.metric` commands | Nothing durable; a `MeasureOutcome` | Throw, run git, write files, leave a process group alive after a timeout, or let a failing `loop.validate` skip `loop.metric` |
+| `src/looplog.ts` | `.kanban/loop/*`, `.kanban/worktrees/*/manifest.json` | Per-base run manifest, iteration log, living summary, best patch, landed marker, worktree manifest | Use a shared global path or sweep a worktree whose owner PID is alive |
 | `src/runner.ts` | Child spec | Pass-through child-session text | Throw; both backends return `ChildResult` errors |
 | `src/prompts.ts` | Stage inputs | Prompt/system-prompt text, parsed stage output | Mention `init` in stage prompts |
 | `src/config.ts` | Defaults, global + repository config files | Resolved merged `KanbanConfig` | Require a user-maintained model limit |
@@ -96,7 +96,7 @@ When changing a feature, preserve these seams:
 - Add plan detail only when it helps a later agent make a decision. Plans must remain readable without identifiers or verbose evidence arrays.
 - Treat a checkpoint payload as a complete replacement for supplied plan sections. Do not add per-item mutation actions just to avoid sending one small array.
 - If adding an external agent status, keep the primary agent special: its working count comes from `ctx.isIdle()`, while external agents are checkpointed.
-- Any new state shape requires migration coverage, init validation updates, README/development documentation updates, and a no-auto-commit review.
+- Any new state shape requires migration coverage, init validation updates, README/development documentation updates, and a review of the private-branch versus user-checkout Git boundary.
 
 ## Non-goals
 

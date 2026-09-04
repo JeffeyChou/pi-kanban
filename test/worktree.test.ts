@@ -18,12 +18,18 @@ import { promisify } from "node:util";
 import {
   applyPatch,
   capturePatch,
+  commitAudit,
+  commitExperiment,
   createDetachedWorktree,
+  ensureExperimentBranch,
+  experimentBranchHead,
   headCommit,
   landPatch,
   modifiedTrackedFiles,
   patchStat,
+  patchBetweenCommits,
   removeWorktreeForce,
+  stageExperimentRange,
 } from "../src/worktree.js";
 
 const execFileAsync = promisify(execFile);
@@ -336,6 +342,33 @@ test("patchStat summarizes a patch without touching the tree", async () => {
   }
 });
 
+test("accepted experiments commit only on their private branch and stage only their final paths", async () => {
+  const { root, repo, base } = await makeRepo();
+  try {
+    const branch = "kanban-autoresearch/session";
+    assert.equal((await ensureExperimentBranch(repo, branch, base)).ok, true);
+    const worktree = join(root, "experiment");
+    assert.equal((await createDetachedWorktree(repo, base, worktree)).ok, true);
+    await writeFile(join(worktree, "tracked.txt"), "accepted\n");
+    await writeFile(join(worktree, "accepted.txt"), "new\n");
+    const committed = await commitExperiment(worktree, repo, branch, "kanban-autoresearch: accepted");
+    assert.equal(committed.ok, true, committed.error);
+    assert.ok(committed.commit);
+    assert.equal(await experimentBranchHead(repo, branch), committed.commit);
+    assert.equal(await headCommit(repo), base, "the user checkout must never be committed by a candidate");
+    const patch = await patchBetweenCommits(repo, base, committed.commit!);
+    assert.match(patch, /accepted\.txt/);
+    assert.equal((await landPatch(repo, patch)).ok, true);
+    await writeFile(join(repo, "unrelated.txt"), "leave unstaged\n");
+    assert.equal((await stageExperimentRange(repo, base, committed.commit!)).ok, true);
+    assert.equal(await gitOk(repo, ["diff", "--cached", "--quiet", "--", "tracked.txt"]), false);
+    assert.equal(await gitOk(repo, ["diff", "--cached", "--quiet", "--", "accepted.txt"]), false);
+    assert.equal(await gitOk(repo, ["diff", "--cached", "--quiet", "--", "unrelated.txt"]), true);
+  } finally {
+    await cleanup(root);
+  }
+});
+
 test("the worktree module never issues git add/commit/stash/reset/checkout or --index/--cached", async () => {
   const { root, repo, base } = await makeRepo();
   try {
@@ -416,6 +449,68 @@ test("the worktree module never issues git add/commit/stash/reset/checkout or --
       }
     }
     await assertIndexEmptyAndHead(repo, base);
+  } finally {
+    await cleanup(root);
+  }
+});
+
+test("commitAudit snapshots every attempt on its own ref, force-adding ignored evidence", async () => {
+  const { root, repo, base } = await makeRepo();
+  try {
+    // commit-tree needs a committer identity, exactly as commitExperiment's commit does.
+    await git(repo, ["config", "user.email", "audit@test"]);
+    await git(repo, ["config", "user.name", "audit"]);
+    const worktree = join(root, "wt");
+    assert.equal((await createDetachedWorktree(repo, base, worktree)).ok, true);
+
+    // The candidate change, plus measurement evidence under a gitignored path.
+    await writeFile(join(worktree, ".gitignore"), "evidence/\n");
+    await writeFile(join(worktree, "tracked.txt"), "one\ntwo\nthree\nfour\n");
+    await mkdir(join(worktree, "evidence"), { recursive: true });
+    await writeFile(join(worktree, "evidence", "gate.log"), "job 42 REJECTED\n");
+
+    const audited = await commitAudit(
+      worktree,
+      repo,
+      "kanban-audit/session",
+      base,
+      "kanban-audit: iteration 1, discard",
+      ["evidence", "no-such-path"],
+    );
+    assert.equal(audited.ok, true);
+    assert.ok(audited.commit);
+    assert.deepEqual(audited.unmatched, ["no-such-path"], "a pathspec with no files is not a failure");
+    assert.equal(
+      (await git(repo, ["rev-parse", "refs/heads/kanban-audit/session"])).trim(),
+      audited.commit,
+      "the audit ref points at the snapshot",
+    );
+    assert.equal(
+      (await git(worktree, ["rev-parse", "HEAD"])).trim(),
+      base,
+      "commit-tree must not move the worktree HEAD",
+    );
+    assert.equal(
+      await git(repo, ["show", `${audited.commit}:evidence/gate.log`]),
+      "job 42 REJECTED\n",
+      "ignored evidence reaches the audit commit",
+    );
+    assert.match(await git(repo, ["show", `${audited.commit}:tracked.txt`]), /four/);
+    assert.equal(
+      await gitOk(worktree, ["diff", "--cached", "--quiet"]),
+      true,
+      "the index is restored, so commitExperiment still sees its own staging",
+    );
+
+    // The accepted commit must stay clean: gitignored evidence belongs to the audit ref only.
+    const accepted = await commitExperiment(worktree, repo, "kanban-autoresearch/session", "kept");
+    assert.equal(accepted.ok, true);
+    assert.equal(
+      await gitOk(repo, ["cat-file", "-e", `${accepted.commit}:evidence/gate.log`]),
+      false,
+      "the accepted experiment commit carries no measurement evidence",
+    );
+    assert.match(await git(repo, ["show", `${accepted.commit}:tracked.txt`]), /four/);
   } finally {
     await cleanup(root);
   }

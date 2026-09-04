@@ -66,10 +66,13 @@ test("loop configuration has explicit defaults and accepts a complete valid laye
     assert.deepEqual(defaults.config.loop, {
       enabled: false,
       direction: "higher",
-      maxIterations: 10,
-      noImprovementStreak: 3,
+      decisionPolicy: "agent-with-validation",
+      maxIterations: 50,
+      noImprovementStreak: 8,
       measureTimeoutMs: 300_000,
       hooks: false,
+      audit: false,
+      autoResume: false,
     });
 
     await mkdir(join(cwd, ".kanban"), { recursive: true });
@@ -82,11 +85,16 @@ test("loop configuration has explicit defaults and accepts a complete valid laye
           metric: "node measure.js",
           metric_name: "latency_ms",
           direction: "lower",
+          decisionPolicy: "strict-metric",
           target: 12.5,
+          baselineMetric: 41.5,
           maxIterations: 7,
           noImprovementStreak: 2,
           measureTimeoutMs: 1234,
           hooks: true,
+          audit: true,
+          auditPaths: ["evidence/run"],
+          autoResume: true,
         },
       }),
     );
@@ -98,11 +106,16 @@ test("loop configuration has explicit defaults and accepts a complete valid laye
       metric: "node measure.js",
       metric_name: "latency_ms",
       direction: "lower",
+      decisionPolicy: "strict-metric",
       target: 12.5,
+      baselineMetric: 41.5,
       maxIterations: 7,
       noImprovementStreak: 2,
       measureTimeoutMs: 1234,
       hooks: true,
+      audit: true,
+      auditPaths: ["evidence/run"],
+      autoResume: true,
     });
     assert.deepEqual(configured.warnings, []);
   } finally {
@@ -158,18 +171,21 @@ test("loop validation warns for unknown, null, invalid, and non-finite values", 
     await writeFile(
       join(cwd, ".kanban", "config.json"),
       // `1e999` is valid JSON parsed as Infinity, so it exercises finite-number validation.
-      '{"loop":{"unknown":true,"enabled":"yes","validate":null,"metric":false,"metric_name":0,"direction":"sideways","target":1e999,"maxIterations":0,"noImprovementStreak":-1,"measureTimeoutMs":0,"hooks":1}}',
+      '{"loop":{"unknown":true,"enabled":"yes","validate":null,"metric":false,"metric_name":0,"direction":"sideways","target":1e999,"baselineMetric":1e999,"maxIterations":0,"noImprovementStreak":-1,"measureTimeoutMs":0,"hooks":1,"audit":"yes","auditPaths":[]}}',
     );
     const invalid = await loadConfig(cwd, agentDir);
     assert.deepEqual(invalid.config.loop, {
       enabled: false,
       direction: "higher",
-      maxIterations: 10,
-      noImprovementStreak: 3,
+      decisionPolicy: "agent-with-validation",
+      maxIterations: 50,
+      noImprovementStreak: 8,
       measureTimeoutMs: 300_000,
       hooks: false,
+      audit: false,
+      autoResume: false,
     });
-    assert.equal(invalid.warnings.length, 11);
+    assert.equal(invalid.warnings.length, 14);
     for (const key of [
       "unknown",
       "enabled",
@@ -178,10 +194,13 @@ test("loop validation warns for unknown, null, invalid, and non-finite values", 
       "metric_name",
       "direction",
       "target",
+      "baselineMetric",
       "maxIterations",
       "noImprovementStreak",
       "measureTimeoutMs",
       "hooks",
+      "audit",
+      "auditPaths",
     ]) {
       assert.match(invalid.warnings.join("\n"), new RegExp(`loop\\.${key}`));
     }
@@ -191,7 +210,7 @@ test("loop validation warns for unknown, null, invalid, and non-finite values", 
       '{"loop":{"maxIterations":-1,"target":NaN}}',
     );
     const negativeAndNaN = await loadConfig(cwd, agentDir);
-    assert.equal(negativeAndNaN.config.loop.maxIterations, 10);
+    assert.equal(negativeAndNaN.config.loop.maxIterations, 50);
     assert.equal(negativeAndNaN.config.loop.target, undefined);
     assert.match(negativeAndNaN.warnings.join("\n"), /Invalid JSON/);
   } finally {

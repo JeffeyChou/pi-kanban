@@ -4,6 +4,12 @@ import type {
   KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { STAGES, selectedSession, type KanbanState, type Session } from "./store.js";
+import {
+  readLoopLog,
+  readLoopRun,
+  type LoopIterationRecord,
+  type LoopRunManifest,
+} from "./looplog.js";
 
 interface LiveWidgetState {
   contextWindow: number;
@@ -265,6 +271,77 @@ export async function showDashboard(
           done({ kind: "remove", title: sessions[selected]!.title });
         else if (matchesKey(keys, input, "tui.select.cancel", ["\u001b"])) done(null);
         tui.requestRender();
+      },
+    };
+  });
+}
+
+/**
+ * A live, explicit experiment table. It intentionally is not another selected-session widget
+ * row: the compact four-line widget remains the low-noise board summary while this panel polls
+ * the append-only durable experiment log.
+ */
+export async function showExperimentDashboard(
+  ctx: ExtensionCommandContext,
+  base: string,
+): Promise<void> {
+  if (!ctx.hasUI) {
+    ctx.ui.notify("Kanban experiment dashboard requires an interactive Pi UI.", "info");
+    return;
+  }
+  await ctx.ui.custom<void>((tui, theme, keys, done) => {
+    let manifest: LoopRunManifest | undefined;
+    let records: LoopIterationRecord[] = [];
+    let closed = false;
+    const refresh = async () => {
+      const [nextManifest, nextRecords] = await Promise.all([
+        readLoopRun(ctx.cwd, base),
+        readLoopLog(ctx.cwd, base),
+      ]).catch((): [LoopRunManifest | undefined, LoopIterationRecord[]] => [undefined, []]);
+      if (closed) return;
+      manifest = nextManifest;
+      records = nextRecords;
+      tui.requestRender();
+    };
+    const timer = setInterval(() => void refresh(), 750);
+    void refresh();
+    const finish = () => {
+      if (closed) return;
+      closed = true;
+      clearInterval(timer);
+      done(undefined);
+    };
+    return {
+      render: (width) => {
+        const rows = [
+          manifest
+            ? `Branch ${manifest.branch} · ${manifest.status} · next #${manifest.nextIteration}`
+            : "No durable autoresearch run for this session.",
+          manifest
+            ? `Baseline ${manifest.baselineMetric ?? "n/a"} · best ${manifest.bestMetric ?? "n/a"} · ${manifest.bestCommit.slice(0, 12)}`
+            : "Run /kanban implement to begin an experiment.",
+          "",
+          "#   decision        metric       validation  commit       rationale / reason",
+          ...records.slice(-12).reverse().map((record) => {
+            const decision = record.decision === "keep"
+              ? `keep (${record.agentDecision ?? "?"})`
+              : `revert (${record.agentDecision ?? "?"})`;
+            const metric = record.metric === undefined ? "—" : String(record.metric);
+            const validation = record.validation === undefined ? "—" : record.validation ? "pass" : "FAIL";
+            const commit = record.commit?.slice(0, 10) ?? "—";
+            const note = record.failureReason ?? record.changed?.split("\n").at(-1) ?? record.lesson ?? "";
+            return `${String(record.iteration).padEnd(3)} ${pad(decision, 15)} ${pad(metric, 12)} ${pad(validation, 11)} ${pad(commit, 11)} ${note}`;
+          }),
+          "",
+          "Auto-refreshes every 0.75s · Esc closes",
+        ];
+        return panelLines("Kanban autoresearch", rows, width).map((line, index) =>
+          index === 0 ? theme.fg("accent", theme.bold(line)) : line,
+        );
+      },
+      invalidate: () => {},
+      handleInput: (input) => {
+        if (matchesKey(keys, input, "tui.select.cancel", ["\u001b"])) finish();
       },
     };
   });

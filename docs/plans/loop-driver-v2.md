@@ -1,6 +1,11 @@
 # Kanban implement-experiment loop — plan v2.5 (patch-based worktree-experiment model)
 
-Status: **APPROVED** — dual adversarial review passed. codex round 6: APPROVE (0 findings) on
+Status: **SUPERSEDED** by the durable private-branch autoresearch implementation. This v2.5
+document remains as the review record for the earlier patch-only loop; its commit-free and
+artifact-deletion invariants no longer describe current behavior. See README, AGENTS.md, and the
+current source/tests for the live contract.
+
+Historical status: **APPROVED** — dual adversarial review passed. codex round 6: APPROVE (0 findings) on
 v2.5; independent reviewer: APPROVE (verified code + git behavior empirically; 3 non-blocking
 MINORs, all folded in). Convergence trend 14→12→6→4→2→0, none architectural. All load-bearing git
 claims empirically verified in a real repo; child tool ids (`edit`/`write`/…) verified as Pi

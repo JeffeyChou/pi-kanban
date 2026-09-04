@@ -190,3 +190,26 @@ test("aborting a running command terminates its complete process group", async (
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+test("measure merges extraEnv over the inherited environment for both commands", async () => {
+  const cwd = await sandbox();
+  process.env.KANBAN_MEASURE_INHERITED = "from-pi";
+  try {
+    const outcome = await measure(
+      cwd,
+      loop({
+        validate: 'test "$KANBAN_ITERATION" = "7" && test "$KANBAN_MEASURE_INHERITED" = "from-pi"',
+        metric: "echo METRIC score=$KANBAN_ITERATION",
+        metric_name: "score",
+      }),
+      new AbortController().signal,
+      { KANBAN_ITERATION: "7" },
+    );
+    assert.equal(outcome.validationPass, true, "both the extra and the inherited variable are visible");
+    assert.equal(outcome.metric, 7);
+    assert.equal(outcome.metricUnmeasured, false);
+  } finally {
+    delete process.env.KANBAN_MEASURE_INHERITED;
+    await rm(cwd, { recursive: true, force: true });
+  }
+});

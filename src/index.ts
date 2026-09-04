@@ -21,10 +21,10 @@ import {
   type PlanSnapshot,
   type WorkSummary,
 } from "./artifacts.js";
-import { detectExternalTools } from "./capabilities.js";
+import { detectExternalTools, isSingleShot } from "./capabilities.js";
 import { loadConfig, type KanbanConfig } from "./config.js";
-import { startImplementLoop } from "./implementloop.js";
-import { deleteLoopArtifacts, sweepLoopWorktrees } from "./looplog.js";
+import { startImplementLoop, type LoopStart } from "./implementloop.js";
+import { deleteLoopArtifacts, readLoopRun, sweepLoopWorktrees } from "./looplog.js";
 import {
   abortPipelineFor,
   clearPipelineRegistry,
@@ -60,13 +60,14 @@ import {
   type SessionState,
   type Stage,
 } from "./store.js";
-import { refreshWidget, showDashboard } from "./ui.js";
+import { refreshWidget, showDashboard, showExperimentDashboard } from "./ui.js";
 import {
   deleteWorkfile,
   readWorkfile,
   sweepOrphanWorkfiles,
   workfileBase,
 } from "./workfile.js";
+import { stageExperimentRange } from "./worktree.js";
 
 const TOOL = "kanban_update";
 const CONFIRM_TIMEOUT_MS = 120_000;
@@ -387,7 +388,22 @@ async function implementCommand(
     await openImplementConversation(pi, ctx, session, config, recorded.compose);
     return;
   }
-  await startImplementLoop(ctx, session.title, loopDeps(config));
+  await awaitWhenHeadless(ctx, await startImplementLoop(ctx, session.title, loopDeps(config)));
+}
+
+/**
+ * Block on a started loop in Pi's single-shot modes.
+ *
+ * `pi -p "/kanban implement"` is the unattended entry point, and print/json mode disposes the
+ * runtime the moment the command returns — an armed-but-unawaited loop would be killed with
+ * it. `tui` and `rpc` own their own process lifetime and must NOT block here, or the loop
+ * would freeze the conversation it reports into.
+ */
+async function awaitWhenHeadless(
+  ctx: ExtensionCommandContext,
+  started: LoopStart,
+): Promise<void> {
+  if (started.armed && isSingleShot(ctx)) await started.run;
 }
 
 /**
@@ -477,6 +493,22 @@ async function openSession(
   }
 
   if (session.stage === "implement") {
+    const savedRun = await readLoopRun(ctx.cwd, workfileBase(session.planPath));
+    if (
+      config.loop.enabled &&
+      config.loop.autoResume &&
+      savedRun?.status === "paused"
+    ) {
+      ctx.ui.notify(
+        `Resuming the paused autoresearch run for “${session.title}” at iteration ${savedRun.nextIteration}.`,
+        "info",
+      );
+      await awaitWhenHeadless(
+        ctx,
+        await startImplementLoop(ctx, session.title, loopDeps(config)),
+      );
+      return;
+    }
     const recorded = await sections(ctx.cwd, session);
     await openImplementConversation(pi, ctx, session, config, recorded.compose);
     return;
@@ -653,10 +685,21 @@ async function completeSession(
     return base;
   });
   await deleteWorkfile(ctx.cwd, done.value);
-  await deleteLoopArtifacts(ctx.cwd, done.value).catch(() => undefined);
+  // Keep `.kanban/loop/<base>.{run,jsonl,md,patch}` after completion: it is the durable
+  // experiment history, not transient pipeline output. `/kanban remove` remains the explicit
+  // destructive cleanup path.
   await refreshWidget(ctx, done.state);
+  const run = await readLoopRun(ctx.cwd, done.value);
+  const staging = run?.status === "success"
+    ? await stageExperimentRange(ctx.cwd, run.baseCommit, run.bestCommit)
+    : undefined;
+  const stagingText = staging
+    ? staging.ok
+      ? `\n\nKanban staged the paths accepted by ${run!.branch}. Review \`git diff --cached\` before committing.`
+      : `\n\nKanban could not stage the accepted experiment paths: ${staging.error ?? "git add failed"}. The working-tree changes were left untouched.`
+    : "";
   return toolResult(
-    completionText(config, archivedPlan!),
+    `${completionText(config, archivedPlan!)}${stagingText}`,
     { title: expectedTitle, status: "complete" },
   );
 }
@@ -869,6 +912,16 @@ export default function kanban(pi: ExtensionAPI): void {
           return;
         }
 
+        if (verb === "experiments") {
+          if (body) {
+            ctx.ui.notify("Usage: /kanban experiments", "error");
+            return;
+          }
+          const session = requireSelectedSession(await load(ctx.cwd));
+          await showExperimentDashboard(ctx, workfileBase(session.planPath));
+          return;
+        }
+
         if (verb === "config") {
           if (body) {
             ctx.ui.notify("Usage: /kanban config", "error");
@@ -928,7 +981,7 @@ export default function kanban(pi: ExtensionAPI): void {
         }
 
         ctx.ui.notify(
-          "Unknown Kanban command. Use /kanban, /kanban create, /kanban open, /kanban implement, /kanban config, /kanban complete, /kanban pause, /kanban unpause, or /kanban remove.",
+          "Unknown Kanban command. Use /kanban, /kanban create, /kanban open, /kanban implement, /kanban experiments, /kanban config, /kanban complete, /kanban pause, /kanban unpause, or /kanban remove.",
           "error",
         );
       } catch (error: unknown) {
@@ -1137,7 +1190,7 @@ export default function kanban(pi: ExtensionAPI): void {
     promptGuidelines: [
       "The tool always updates the selected session; never invent or request session, task, or todo IDs.",
       "Use checkpoint only for material scope, agent, work-summary, or handoff changes.",
-      "Use stage_complete only after the current stage is complete. Follow the transition and completion instructions carried in the tool result; never run git commit automatically.",
+      "Use stage_complete only after the current stage is complete. Follow the transition and completion instructions carried in the tool result; the autoresearch host may commit accepted candidates only on its private experiment branch, while the user still decides whether to commit final staged work.",
     ],
     parameters: Type.Object({
       action: StringEnum(["checkpoint", "stage_complete"] as const),

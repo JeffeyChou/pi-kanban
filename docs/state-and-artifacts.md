@@ -93,7 +93,8 @@ overwrite another's:
 
 | Path | Contents |
 | --- | --- |
-| `loop/<base>.jsonl` | One JSON record per iteration: decision, changed summary, validation, metric, failure reason, lesson, verdict. |
+| `loop/<base>.run.json` | Atomic recovery point: private branch, base/best commit, audit ref and its tip, baseline/best metric, next iteration, and terminal/resumable status. |
+| `loop/<base>.jsonl` | One JSON record per iteration: agent decision, host decision, private commit when kept, audit commit when `loop.audit` is on, changed summary, validation, metric, failure reason, lesson, verdict. |
 | `loop/<base>.md` | The bounded living summary injected into the next iteration's prompt. |
 | `loop/<base>.patch` | The best-so-far patch, always written before landing so a failed `git apply` is recoverable by hand. |
 | `loop/<base>.landed` | Atomic `{ base, patchSha }` marker written after a successful apply and BEFORE the advancing mutate, so a re-run never applies the same patch twice. |
@@ -101,8 +102,15 @@ overwrite another's:
 | `worktrees/<base>/manifest.json` | Active worktree paths with their owner PID and start time. Startup removes only dead-owner worktrees. |
 
 The loop adds NO `state.json` field: its run identity is the existing `mode: "pipeline"` plus
-`pipelineToken`. Artifacts are deleted after a successful advance and at `/kanban remove`, and are
-deliberately KEPT after EXHAUSTED or FAILURE so the lessons and the patch survive for the user.
+`pipelineToken`. Its artifacts are durable experiment history: they are kept after success,
+pause, exhaustion, and failure so a new agent can rehydrate from the run manifest plus JSONL;
+`/kanban remove` is the explicit cleanup path.
+
+Two Git refs outlive all of it, because a swept worktree must not take the record with it:
+`kanban-autoresearch/<base>` (accepted candidates only) and, with `loop.audit`,
+`kanban-audit/<base>` (one commit per attempt, including discarded ones, with `loop.auditPaths`
+force-added so gitignored evidence is inside the snapshot). `/kanban remove` deletes the
+`.kanban/loop/` files but never a ref; deleting those is the user's decision.
 
 - **Resume authority is `state.json`'s stage ONLY**: sections are prompt inputs. `/kanban open` on a child-run stage re-runs the CURRENT stage (a stale section for it is overwritten). At implement/critique it opens the conversation; a missing workfile there is tolerated — the seed notes "spec unavailable" and the agent proceeds from the plan JSON.
 - **Lifecycle**: created on the first section write; deleted at final completion and at `/kanban remove`; never created by migration; orphans (base matching no session in ANY state, active or blocked) are swept at startup — a paused session keeps its workfile.

@@ -48,6 +48,7 @@ function runCommand(
   command: string,
   timeoutMs: number,
   signal: AbortSignal,
+  extraEnv?: Record<string, string>,
 ): Promise<CommandOutcome> {
   if (signal.aborted) {
     return Promise.resolve({
@@ -104,6 +105,10 @@ function runCommand(
         cwd,
         detached: true,
         stdio: ["ignore", "pipe", "pipe"],
+        // Loop commands inherit Pi's environment on purpose: site profiles, module paths and
+        // credentials are exported by the shell that started Pi. `extraEnv` adds the iteration
+        // identity so a command that records external evidence can attribute it.
+        env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
       });
     } catch {
       finish({
@@ -173,12 +178,19 @@ export function parseMetric(output: string, name?: string): number | undefined {
  * (`spawn("bash", ["-c", cmd], { cwd, detached: true })`) and group-killed
  * (`process.kill(-pid)`) on `loop.measureTimeoutMs` or `signal`.
  *
+ * `extraEnv` is merged over Pi's own environment for both commands.
+ *
+ * Note that both commands always run: a failing `loop.validate` does NOT short-circuit
+ * `loop.metric`. A command that must not run after a cheap check fails has to make that check
+ * itself.
+ *
  * Never throws: every failure becomes a MeasureOutcome with `validationPass: false`.
  */
 export async function measure(
   cwd: string,
   loop: LoopConfig,
   signal: AbortSignal,
+  extraEnv?: Record<string, string>,
 ): Promise<MeasureOutcome> {
   if (signal.aborted) {
     return {
@@ -190,10 +202,10 @@ export async function measure(
 
   try {
     const validation = loop.validate !== undefined
-      ? await runCommand(cwd, loop.validate, loop.measureTimeoutMs, signal)
+      ? await runCommand(cwd, loop.validate, loop.measureTimeoutMs, signal, extraEnv)
       : undefined;
     const metricCommand = loop.metric !== undefined
-      ? await runCommand(cwd, loop.metric, loop.measureTimeoutMs, signal)
+      ? await runCommand(cwd, loop.metric, loop.measureTimeoutMs, signal, extraEnv)
       : undefined;
     const metric = metricCommand
       ? parseMetric(metricCommand.stdout, loop.metric_name)

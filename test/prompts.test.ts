@@ -296,31 +296,41 @@ test("the implement loop prompt omits the metric prose when no metric is configu
 test("the implement verdict defaults to continue and takes the last Status line", () => {
   assert.deepEqual(parseImplementLoopOutput("Status: complete\nRationale: done"), {
     verdict: "complete",
+    decision: "keep",
     rationale: "done",
   });
-  assert.deepEqual(parseImplementLoopOutput("**Status:** continue"), { verdict: "continue" });
+  assert.deepEqual(parseImplementLoopOutput("**Status:** continue"), { verdict: "continue", decision: "keep" });
   assert.deepEqual(parseImplementLoopOutput("Status: complete\nStatus: continue"), {
     verdict: "continue",
+    decision: "keep",
   });
-  assert.deepEqual(parseImplementLoopOutput("no verdict at all"), { verdict: "continue" });
+  assert.deepEqual(parseImplementLoopOutput("no verdict at all"), { verdict: "continue", decision: "keep" });
   // A line that merely ECHOES the required grammar must never score as a verdict: this verdict
   // gates the stage advance, so prefix leniency would buy a false advance.
   assert.deepEqual(parseImplementLoopOutput("- Status: complete when the spec is met"), {
     verdict: "continue",
+    decision: "keep",
   });
   assert.deepEqual(parseImplementLoopOutput("Status: continue for now, then complete"), {
     verdict: "continue",
+    decision: "keep",
   });
   // Markdown emphasis and trailing punctuation around a real verdict still parse.
-  assert.deepEqual(parseImplementLoopOutput("Status: **complete**."), { verdict: "complete" });
-  assert.deepEqual(parseImplementLoopOutput(""), { verdict: "continue" });
+  assert.deepEqual(parseImplementLoopOutput("Status: **complete**."), { verdict: "complete", decision: "keep" });
+  assert.deepEqual(parseImplementLoopOutput(""), { verdict: "continue", decision: "keep" });
   // Case-insensitive, but only for an exact verdict: trailing prose is not a verdict.
   assert.deepEqual(parseImplementLoopOutput("Status: COMPLETE\nRationale: shipped"), {
     verdict: "complete",
+    decision: "keep",
     rationale: "shipped",
   });
   assert.deepEqual(parseImplementLoopOutput("Status: Complete now\nRationale: shipped"), {
     verdict: "continue",
+    decision: "keep",
     rationale: "shipped",
+  });
+  assert.deepEqual(parseImplementLoopOutput("Status: continue\nDecision: revert"), {
+    verdict: "continue",
+    decision: "revert",
   });
 });

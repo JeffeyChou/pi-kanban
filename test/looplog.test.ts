@@ -24,10 +24,12 @@ import {
   loopLandedPath,
   loopLogPath,
   loopPatchPath,
+  loopRunPath,
   loopSummaryPath,
   readBestPatch,
   readLandedMarker,
   readLoopLog,
+  readLoopRun,
   readWorktreeManifest,
   registerWorktree,
   renderLivingSummary,
@@ -36,6 +38,7 @@ import {
   worktreeRoot,
   writeBestPatch,
   writeLandedMarker,
+  writeLoopRun,
 } from "../src/looplog.js";
 import type {
   LoopIterationRecord,
@@ -88,8 +91,35 @@ test("loop paths are per session base under .kanban", async () => {
     assert.equal(loopSummaryPath(cwd, "2026-09-01-x"), join(cwd, ".kanban", "loop", "2026-09-01-x.md"));
     assert.equal(loopPatchPath(cwd, "2026-09-01-x"), join(cwd, ".kanban", "loop", "2026-09-01-x.patch"));
     assert.equal(loopLandedPath(cwd, "2026-09-01-x"), join(cwd, ".kanban", "loop", "2026-09-01-x.landed"));
+    assert.equal(loopRunPath(cwd, "2026-09-01-x"), join(cwd, ".kanban", "loop", "2026-09-01-x.run.json"));
     assert.equal(worktreeRoot(cwd, "base-a"), join(cwd, ".kanban", "worktrees", "base-a"));
     assert.equal(iterationWorktreePath(cwd, "base-a", 3), join(cwd, ".kanban", "worktrees", "base-a", "3"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("loop run manifest is atomic, readable, and rejects corrupt recovery state", async () => {
+  const cwd = await sandbox();
+  try {
+    assert.equal(await readLoopRun(cwd, "session"), undefined);
+    const run = {
+      schemaVersion: 1 as const,
+      base: "session",
+      branch: "kanban-autoresearch/session",
+      baseCommit: "a".repeat(40),
+      bestCommit: "b".repeat(40),
+      baselineMetric: 1,
+      bestMetric: 2,
+      nextIteration: 4,
+      status: "paused" as const,
+      startedAt: "2026-09-02T00:00:00.000Z",
+      updatedAt: "2026-09-02T00:01:00.000Z",
+    };
+    await writeLoopRun(cwd, "session", run);
+    assert.deepEqual(await readLoopRun(cwd, "session"), run);
+    await writeFile(loopRunPath(cwd, "session"), "{bad json\n", "utf8");
+    assert.equal(await readLoopRun(cwd, "session"), undefined);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

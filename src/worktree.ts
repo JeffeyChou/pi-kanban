@@ -1,9 +1,11 @@
 /**
  * Plain-git worktree + patch primitives for the implement-experiment loop.
  *
- * HARD INVARIANT (AGENTS.md, architecture.md): this module NEVER runs `git add`, `git commit`,
- * or any other index-mutating command. `git apply` is always called WITHOUT `--index`, so every
- * applied change lands in a working tree only, unstaged.
+ * The normal patch primitives remain index-free. The autoresearch loop additionally owns an
+ * isolated `kanban-autoresearch/<base>` ref: it may stage and commit **only inside a disposable
+ * detached iteration worktree**, never in the user's checkout. Landing into the checkout still
+ * uses `git apply` without `--index`; final-session staging is a separate, explicit lifecycle
+ * action.
  */
 
 import { execFile, spawn } from "node:child_process";
@@ -108,7 +110,8 @@ export async function modifiedTrackedFiles(cwd: string): Promise<string[]> {
   return [...names].sort();
 }
 
-/** `git worktree add --detach <path> <base>` — detached, so the loop creates NO branches. */
+/** `git worktree add --detach <path> <base>` — disposable candidate worktrees remain detached;
+ * accepted commits are published afterward through the private experiment ref. */
 export async function createDetachedWorktree(
   cwd: string,
   base: string,
@@ -117,6 +120,140 @@ export async function createDetachedWorktree(
   await mkdir(dirname(path), { recursive: true });
   const run = await runGit(cwd, ["worktree", "add", "--detach", path, base]);
   return { ok: run.ok, error: run.ok ? undefined : run.error };
+}
+
+/** Ensure the durable private experiment branch exists at `base`. */
+export async function ensureExperimentBranch(
+  cwd: string,
+  branch: string,
+  base: string,
+): Promise<GitOutcome> {
+  const existing = await runGit(cwd, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+  if (existing.ok) return { ok: true };
+  const created = await runGit(cwd, ["branch", branch, base]);
+  return { ok: created.ok, error: created.ok ? undefined : created.error };
+}
+
+/** Read an experiment branch's commit, or undefined when the ref no longer exists. */
+export async function experimentBranchHead(cwd: string, branch: string): Promise<string | undefined> {
+  const run = await runGit(cwd, ["rev-parse", "--verify", `refs/heads/${branch}`]);
+  return run.ok ? run.stdout.trim() : undefined;
+}
+
+export interface ExperimentCommitOutcome extends GitOutcome {
+  commit?: string;
+}
+
+/**
+ * Commit one accepted experiment in its detached worktree, then advance the durable branch ref.
+ * This is intentionally the only loop code path that mutates a Git index. The user's checkout is
+ * never its cwd, and rejected candidates never reach this function.
+ */
+export async function commitExperiment(
+  worktreeCwd: string,
+  mainCwd: string,
+  branch: string,
+  message: string,
+): Promise<ExperimentCommitOutcome> {
+  const added = await runGit(worktreeCwd, ["add", "-A"]);
+  if (!added.ok) return { ok: false, error: added.error };
+  const committed = await runGit(worktreeCwd, ["commit", "-m", message]);
+  if (!committed.ok) return { ok: false, error: committed.error };
+  const commit = await headCommit(worktreeCwd);
+  if (!commit) return { ok: false, error: "git commit succeeded but HEAD could not be resolved" };
+  const advanced = await runGit(mainCwd, ["branch", "-f", branch, commit]);
+  if (!advanced.ok) return { ok: false, error: advanced.error };
+  return { ok: true, commit };
+}
+
+export interface AuditCommitOutcome extends GitOutcome {
+  commit?: string;
+  /** Pathspecs that produced no files; informational, never a failure. */
+  unmatched?: string[];
+}
+
+/**
+ * Snapshot the worktree as ONE audit commit on `ref`, whatever the iteration's decision was.
+ *
+ * This is the durable evidence seam for measurements whose output cannot be reproduced later —
+ * a scheduler job log, a captured run directory. The worktree files are disposable, so the
+ * snapshot is the only thing that survives; `ref` accumulates a linear log of every attempt,
+ * including rejected ones, and it is deliberately NOT the accepted-experiment branch.
+ *
+ * `forcePaths` pathspecs are force-added, so measurement evidence may sit under a gitignored
+ * path and therefore stay out of the accepted commit and out of the landed patch. The index is
+ * restored to HEAD afterwards, so this never changes what `commitExperiment` would commit, and
+ * `git commit-tree` leaves HEAD and the branch refs alone.
+ */
+export async function commitAudit(
+  worktreeCwd: string,
+  mainCwd: string,
+  ref: string,
+  parent: string,
+  message: string,
+  forcePaths: string[] = [],
+): Promise<AuditCommitOutcome> {
+  const restoreIndex = async () => {
+    await runGit(worktreeCwd, ["reset", "--quiet"]);
+  };
+  try {
+    const added = await runGit(worktreeCwd, ["add", "-A"]);
+    if (!added.ok) return { ok: false, error: added.error };
+    const unmatched: string[] = [];
+    for (const path of forcePaths) {
+      // One pathspec at a time: an evidence directory a given iteration never wrote is normal,
+      // and must not discard the evidence the other pathspecs did produce.
+      const forced = await runGit(worktreeCwd, ["add", "-A", "-f", "--", path]);
+      if (!forced.ok) unmatched.push(path);
+    }
+    const tree = await runGit(worktreeCwd, ["write-tree"]);
+    if (!tree.ok) return { ok: false, error: tree.error };
+    const created = await runGit(worktreeCwd, [
+      "commit-tree",
+      tree.stdout.trim(),
+      "-p",
+      parent,
+      "-m",
+      message,
+    ]);
+    if (!created.ok) return { ok: false, error: created.error };
+    const commit = created.stdout.trim();
+    if (!commit) return { ok: false, error: "git commit-tree produced no commit id" };
+    const published = await runGit(mainCwd, ["update-ref", `refs/heads/${ref}`, commit]);
+    if (!published.ok) return { ok: false, error: published.error };
+    return { ok: true, commit, ...(unmatched.length ? { unmatched } : {}) };
+  } finally {
+    await restoreIndex();
+  }
+}
+
+/** Binary patch of all accepted experiment commits from `base` through `commit`. */
+export async function patchBetweenCommits(
+  cwd: string,
+  base: string,
+  commit: string,
+): Promise<string> {
+  const run = await runGit(cwd, ["diff", "--binary", base, commit]);
+  if (!run.ok) throw new Error(`git diff --binary ${base} ${commit} failed: ${run.error}`);
+  return run.stdout.trim() === "" ? "" : run.stdout;
+}
+
+/**
+ * Stage precisely the paths changed by accepted experiment commits, including deletions. This
+ * intentionally never stages the whole checkout: unrelated user work outside the experiment
+ * range remains untouched in the index.
+ */
+export async function stageExperimentRange(
+  cwd: string,
+  base: string,
+  commit: string,
+): Promise<GitOutcome> {
+  const changed = await runGit(cwd, ["diff", "--name-only", "-z", base, commit]);
+  if (!changed.ok) return { ok: false, error: changed.error };
+  const paths = changed.stdout.split("\0").filter(Boolean);
+  if (!paths.length) return { ok: true };
+  const staged = await runGit(cwd, ["add", "-A", "--", ...paths]);
+  return { ok: staged.ok, error: staged.ok ? undefined : staged.error };
 }
 
 async function applyViaStdin(cwd: string, args: string[], patch: string): Promise<GitOutcome> {

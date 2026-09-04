@@ -11,6 +11,16 @@ import { removeWorktreeForce } from "./worktree.js";
 export interface LoopIterationRecord {
   iteration: number;
   decision: "keep" | "discard";
+  /** The iteration agent's requested disposition, before host safety gates. */
+  agentDecision?: "keep" | "revert";
+  /** Commit on the private kanban-autoresearch branch when this attempt was kept. */
+  commit?: string;
+  /**
+   * Commit on the `kanban-audit/<base>` ref holding this attempt's tree and evidence, written
+   * for kept AND discarded iterations when `loop.audit` is on. Inspect a long-gone iteration
+   * with `git show <auditCommit>` after its worktree has been swept.
+   */
+  auditCommit?: string;
   /** `git diff --stat` of the candidate plus the child's one-line rationale. */
   changed?: string;
   validation?: boolean;
@@ -24,6 +34,27 @@ export interface LoopIterationRecord {
   /** The child's `Status:` verdict for this iteration. */
   verdict?: "complete" | "continue";
   at: string;
+}
+
+/** Durable identity and recovery point for one autoresearch run. */
+export interface LoopRunManifest {
+  schemaVersion: 1;
+  base: string;
+  branch: string;
+  baseCommit: string;
+  /** The most recent accepted private experiment commit; baseCommit before the first keep. */
+  bestCommit: string;
+  /** The audit ref accumulating one commit per iteration; absent when `loop.audit` is off. */
+  auditRef?: string;
+  /** Tip of `auditRef`, so audit commits chain linearly across restarts. */
+  auditCommit?: string;
+  baselineMetric?: number;
+  bestMetric?: number;
+  /** Next iteration to run, so a fresh agent never repeats a completed attempt. */
+  nextIteration: number;
+  status: "running" | "paused" | "exhausted" | "failure" | "success";
+  startedAt: string;
+  updatedAt: string;
 }
 
 export interface WorktreeEntry {
@@ -62,6 +93,10 @@ export function loopPatchPath(cwd: string, base: string): string {
 /** `.kanban/loop/<base>.landed` — `{ base, patchSha }` marker written before the advance. */
 export function loopLandedPath(cwd: string, base: string): string {
   return join(loopDir(cwd), `${base}.landed`);
+}
+/** `.kanban/loop/<base>.run.json` — the crash/restart recovery source of truth. */
+export function loopRunPath(cwd: string, base: string): string {
+  return join(loopDir(cwd), `${base}.run.json`);
 }
 /** `.kanban/worktrees/<base>` — gitignored with the rest of `.kanban/`. */
 export function worktreeRoot(cwd: string, base: string): string {
@@ -260,6 +295,44 @@ export async function readBestPatch(
   base: string,
 ): Promise<string | undefined> {
   return readText(loopPatchPath(cwd, base));
+}
+
+/** Atomically persist the complete recovery point after every baseline/iteration boundary. */
+export async function writeLoopRun(
+  cwd: string,
+  base: string,
+  manifest: LoopRunManifest,
+): Promise<void> {
+  await atomicWrite(loopRunPath(cwd, base), `${JSON.stringify(manifest)}\n`);
+}
+
+/** Read a valid recovery point; corruption is deliberately recoverable as `undefined`. */
+export async function readLoopRun(
+  cwd: string,
+  base: string,
+): Promise<LoopRunManifest | undefined> {
+  const content = await readText(loopRunPath(cwd, base));
+  if (content === undefined) return undefined;
+  try {
+    const value = JSON.parse(content) as Partial<LoopRunManifest>;
+    if (
+      value.schemaVersion === 1 &&
+      typeof value.base === "string" &&
+      typeof value.branch === "string" &&
+      typeof value.baseCommit === "string" &&
+      typeof value.bestCommit === "string" &&
+      typeof value.nextIteration === "number" &&
+      Number.isInteger(value.nextIteration) &&
+      value.nextIteration >= 1 &&
+      ["running", "paused", "exhausted", "failure", "success"].includes(value.status ?? "") &&
+      typeof value.startedAt === "string" &&
+      typeof value.updatedAt === "string"
+    )
+      return value as LoopRunManifest;
+  } catch {
+    // An interrupted write cannot poison a future manual resume.
+  }
+  return undefined;
 }
 
 /** Atomic (tmp + rename) `{ base, patchSha }` marker written BEFORE the advancing mutate. */

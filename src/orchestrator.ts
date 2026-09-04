@@ -5,6 +5,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { readPlan, writePlan, type PlanSnapshot } from "./artifacts.js";
+import { isSingleShot } from "./capabilities.js";
 import type { KanbanConfig, StageModelKey } from "./config.js";
 import {
   RESEARCH_ANGLE_LABELS,
@@ -728,6 +729,10 @@ export async function startPipeline(
       "error",
     );
   });
+  // Single-shot (`pi -p "/kanban create …"`): print/json mode disposes the runtime as soon as
+  // the command returns, so an armed-but-unawaited pipeline would be killed mid-stage. An
+  // interactive session must not block here — the pipeline reports into that conversation.
+  if (isSingleShot(ctx)) await entry.promise;
 }
 
 /* ------------------------------------------------------------------------------------------ *

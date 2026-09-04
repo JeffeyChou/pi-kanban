@@ -286,7 +286,7 @@ export function implementKickoff(
     );
   lines.push(
     "",
-    "Checkpoint contract: call `kanban_update` with `checkpoint` only at material milestones — a scope change, an agent-roster change, a meaningful work-summary change, or a new handoff note. Never call it per file, command, or tool call. Call `stage_complete` once the whole implementation is done and validated; that arms the critique gate. Never run `git add` or `git commit` automatically.",
+    "Checkpoint contract: call `kanban_update` with `checkpoint` only at material milestones — a scope change, an agent-roster change, a meaningful work-summary change, or a new handoff note. Never call it per file, command, or tool call. Call `stage_complete` once the whole implementation is done and validated; that arms the critique gate.",
   );
   lines.push(
     "",
@@ -312,7 +312,7 @@ export function completionText(config: KanbanConfig, plan: PlanSnapshot): string
     );
   lines.push(
     "",
-    `Never run \`git add\` or \`git commit\` automatically. End with a Suggested commit section for the user to decide. Suggested commit: kanban: ${plan.title}`,
+    `Kanban stages verified session changes at final completion when their ownership is known. Review the staged diff, then decide whether to commit. Suggested commit: kanban: ${plan.title}`,
   );
   return lines.join("\n");
 }
@@ -338,6 +338,8 @@ export interface ImplementLoopInputs {
   hasMetric?: boolean;
   metricName?: string;
   direction?: "higher" | "lower";
+  /** The host's final safety policy for an agent keep/revert decision. */
+  decisionPolicy?: "strict-metric" | "agent-with-validation";
   target?: number;
   /** Best metric so far, for context. */
   bestMetric?: number;
@@ -350,6 +352,8 @@ export interface ImplementLoopVerdict {
   verdict: "complete" | "continue";
   /** One-line self-report recorded with the iteration. */
   rationale?: string;
+  /** The experiment agent's explicit disposition for its candidate. */
+  decision: "keep" | "revert";
 }
 
 function fitnessLines(inputs: ImplementLoopInputs): string[] {
@@ -366,7 +370,9 @@ function fitnessLines(inputs: ImplementLoopInputs): string[] {
     const goal =
       inputs.direction === "lower" ? "strictly lower" : "strictly higher";
     lines.push(
-      `- A metric${inputs.metricName ? ` (\`${inputs.metricName}\`)` : ""} is also measured, and your work is kept only when it is ${goal} than the best so far${inputs.bestMetric === undefined ? "" : ` (${inputs.bestMetric})`}${inputs.target === undefined ? "" : `; the target is ${inputs.target}`}.`,
+      inputs.decisionPolicy === "agent-with-validation"
+        ? `- A metric${inputs.metricName ? ` (\`${inputs.metricName}\`)` : ""} is recorded for every attempt. You decide whether its trade-off is worth keeping, but Kanban rejects a missing metric and any failed validation${inputs.target === undefined ? "" : `; the target is ${inputs.target}`}.`
+        : `- A metric${inputs.metricName ? ` (\`${inputs.metricName}\`)` : ""} is also measured, and your work is kept only when it is ${goal} than the best so far${inputs.bestMetric === undefined ? "" : ` (${inputs.bestMetric})`}${inputs.target === undefined ? "" : `; the target is ${inputs.target}`}.`,
     );
   }
   lines.push(
@@ -381,7 +387,7 @@ export function implementLoopPrompt(inputs: ImplementLoopInputs): string {
     `# Kanban implement stage — iteration ${inputs.iteration} of ${inputs.maxIterations} — “${inputs.title}”`,
     "",
     "You are executing the implement stage of the Kanban workflow as ONE experiment in an iterative loop.",
-    "Your working directory is a private, disposable git worktree. Nothing you write reaches the user's checkout unless Kanban measures this iteration as an improvement and lands it.",
+    "Your working directory is a private experiment worktree. Kept iterations are committed by Kanban to the session's kanban-autoresearch branch; reverted iterations are discarded completely.",
     "",
     "## Original request",
     "",
@@ -414,14 +420,15 @@ export function implementLoopPrompt(inputs: ImplementLoopInputs): string {
     "- Read before you write: this worktree already contains any change earlier iterations got kept.",
     "- You can read, search, edit and write files. You have NO shell: you cannot run commands, tests, or git. Kanban runs the validation for you, so do not ask for it and do not fake evidence of it.",
     "- Stay inside this worktree. Never edit an absolute path outside it and never reach upwards with `../`.",
-    "- Follow the repository's own conventions and its AGENTS.md; never stage or commit anything.",
+    "- Follow the repository's own conventions and its AGENTS.md; Kanban, not you, stages or commits an accepted experiment.",
     "",
     "## Required output",
     "",
-    "End your reply with exactly these two lines:",
+    "End your reply with exactly these three lines:",
     "",
     "`Status: complete` when the recorded spec is now FULLY implemented and you would hand it to review, or `Status: continue` when more iterations are needed.",
     "`Rationale: <one line>` — what you changed this iteration and why.",
+    "`Decision: keep` when this candidate should become the next experiment base, or `Decision: revert` when it should be discarded. State your real judgement; Kanban still enforces validation and configured-metric safety.",
     "",
     "`Status: complete` is a claim Kanban acts on: it ends the loop and advances the session to critique. Only write it when the spec is genuinely finished.",
   );
@@ -439,6 +446,9 @@ export function implementLoopPrompt(inputs: ImplementLoopInputs): string {
 export function parseImplementLoopOutput(text: string): ImplementLoopVerdict {
   let verdict: "complete" | "continue" = "continue";
   let rationale: string | undefined;
+  // `keep` is the compatibility default for an existing iteration child which
+  // predates the explicit decision grammar. New prompts require the line.
+  let decision: "keep" | "revert" = "keep";
   for (const line of (text ?? "").split(/\r?\n/)) {
     const status = labelled(line, "Status");
     if (status !== undefined) {
@@ -449,6 +459,12 @@ export function parseImplementLoopOutput(text: string): ImplementLoopVerdict {
     }
     const reason = labelled(line, "Rationale");
     if (reason) rationale = reason;
+    const disposition = labelled(line, "Decision");
+    if (disposition !== undefined) {
+      const value = disposition.replace(/[`*_]/g, "").replace(/[.!;,]+$/, "").trim().toLowerCase();
+      if (value === "keep") decision = "keep";
+      else if (value === "revert" || value === "discard") decision = "revert";
+    }
   }
-  return { verdict, ...(rationale ? { rationale } : {}) };
+  return { verdict, decision, ...(rationale ? { rationale } : {}) };
 }

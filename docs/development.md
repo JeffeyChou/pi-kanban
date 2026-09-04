@@ -84,7 +84,7 @@ Stage order is fixed:
 refine → research → grill → compose → implement → critique
 ```
 
-In pipeline mode the orchestrator advances the child-owned stages (refine → compose), one stage per locked commit; `stage_complete` advances the agent-owned stages (implement, critique) and every stage in manual mode. When `config.loop.enabled`, `/kanban implement` makes implement orchestrator-owned too: the loop lands the winning patch as unstaged working-tree changes and its own locked commit advances implement→critique, while `stage_complete(implement)` is refused for as long as that run is live. Transition instructions ride in the tool result — there is no queued kickoff injection. The final call runs the critique gate (see agent-workflow.md), writes the plan as `complete` with its `completion` record, removes the session from state, deletes the workfile, and carries the configured completion-check command in its result; it resets the handoff only when no active session remains. It does not commit.
+In pipeline mode the orchestrator advances the child-owned stages (refine → compose), one stage per locked commit; `stage_complete` advances the agent-owned stages (implement, critique) and every stage in manual mode. When `config.loop.enabled`, `/kanban implement` makes implement orchestrator-owned too: it is the durable autoresearch loop. Kept candidates are committed only to `kanban-autoresearch/<base>` and a manifest plus JSONL history rehydrates a later fresh child; its final branch diff lands as unstaged working-tree changes and its locked state commit advances implement→critique. Final completion stages only accepted experiment paths and suggests a user commit message; it never commits the user checkout. Transition instructions ride in the tool result — there is no queued kickoff injection.
 
 `session_start` and `model_select` load the durable board and refresh its widget, but never persist or switch Pi conversation paths. `agent_start`, `agent_end`, and `tool_execution_end` refresh the widget from durable state and Pi live data without writing state. Do not reintroduce a per-tool activity log or per-tool mutation: low write frequency and low prompt noise are core requirements.
 
@@ -115,7 +115,9 @@ The selected-session widget is exactly four logical lines: task title, current s
 
 `loop.validate` and `loop.metric` are the only commands Kanban itself executes, plus the opt-in `.kanban/hooks/{before,after}-iteration` scripts when `loop.hooks` is set. All of them run only inside a disposable iteration worktree and are never derived from `init.*`.
 
-Init commands come from config (`.kanban/config.json`, `"auto"` resolves to an executable `./init.sh`) and appear only in the implement kickoff, the completion text, and the handoff header when configured. The script, kickoff, tool guidance, and final handoff must all preserve the no-auto-commit rule. Never add `git add` or `git commit` to extension or script automation.
+Measurement may be arbitrarily slow, which shapes three behaviors worth keeping in mind when changing this area: `loop.measureTimeoutMs` bounds one command's entire wait (queue time included, for a scheduler-backed measurement); `loop.baselineMetric` replaces the baseline measurement with a value the operator already has; and `loop.audit` snapshots every attempt onto `kanban-audit/<base>` because a disposable worktree is not a place to leave evidence. Single-shot Pi modes await the run through `isSingleShot`, so `pi -p "/kanban implement"` does not exit out from under an armed loop.
+
+Init commands come from config (`.kanban/config.json`, `"auto"` resolves to an executable `./init.sh`) and appear only in the implement kickoff, the completion text, and the handoff header when configured. Only the autoresearch worktree may run `git add`/`git commit`, and only for a validated, accepted candidate on its private branch. Final completion may stage experiment-owned paths, but no extension code commits the user's checkout.
 
 Before submitting changes, run:
 
@@ -125,4 +127,4 @@ npm test
 ./init.sh --check
 ```
 
-Manual Pi verification should cover generated and fallback titles; all six stages; material checkpoints; dashboard navigation, status preview, management mode, and borders; context on more than one model and Pi conversation; dashboard open without an old-chat switch; rename/pause/unpause/remove confirmations; v1/v2/v3 migration; final plan retention with state cleanup; and the no-auto-commit final output.
+Manual Pi verification should cover generated and fallback titles; all six stages; material checkpoints; dashboard navigation, status preview, management mode, and borders; the live `/kanban experiments` table; context on more than one model and Pi conversation; dashboard open without an old-chat switch; rename/pause/unpause/remove confirmations; v1/v2/v3 migration; private experiment branch commits/reverts and resume; final plan retention with state cleanup; and experiment-path-only final staging.
