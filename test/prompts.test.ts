@@ -202,6 +202,44 @@ test("critique gate parsing defaults to FAIL with a safe issue list", () => {
   assert.deepEqual(bare.issues, ["critique produced no parseable issues"]);
 });
 
+test("grill preserves distinct options, descriptions and a non-first recommendation", () => {
+  const parsed = parseStageOutput("grill", `## grill
+Q: 需要多深入的研究？
+Option: 聚焦 | 只检查受影响模块与测试。
+Option: 深入 | 追踪依赖和兼容风险 | 需要更多时间。
+Option: 聚焦 | duplicate
+Recommended: 深入
+Q: Keep compatibility?
+Recommended: yes
+### Settled
+Option: unrelated | must not attach to a previous question`);
+  assert.deepEqual(parsed.questions, [
+    { q: "需要多深入的研究？", recommended: "深入", options: [
+      { label: "聚焦", description: "只检查受影响模块与测试。" },
+      { label: "深入", description: "追踪依赖和兼容风险 | 需要更多时间。" },
+    ] },
+    { q: "Keep compatibility?", recommended: "yes" },
+  ]);
+});
+
+test("planning effort changes depth and spec granularity while keeping every assigned angle", () => {
+  const focused = stagePrompt("research", inputs({ researchAngles: [1, 2] }));
+  assert.match(focused, /repository structure and conventions/);
+  assert.match(focused, /affected code paths and facts/);
+  assert.match(focused, /at most 6 targeted tool calls/);
+  assert.doesNotMatch(focused, /Another worker covers each/);
+  assert.match(stagePrompt("research", inputs({ researchDepth: "deep" })), /Deep research/);
+  assert.match(stagePrompt("compose", inputs()), /3–7 coherent steps/);
+  assert.match(stagePrompt("compose", inputs()), /120–240 lines/);
+  assert.match(stagePrompt("compose", inputs()), /INCLUDING the `## compose` heading/);
+  for (const section of ["Summary", "Goals and non-goals", "Proposed approach", "Implementation steps", "Validation and acceptance", "Risks and assumptions"])
+    assert(stagePrompt("compose", inputs()).includes(`### ${section}`));
+  assert.match(stagePrompt("compose", inputs({ composeDetail: "concise" })), /at most 100 lines/);
+  assert.match(stagePrompt("compose", inputs({ composeDetail: "detailed" })), /within 220 lines/);
+  assert.match(stagePrompt("grill", inputs()), /2–4 `Option:/);
+  assert.match(stagePrompt("grill", inputs()), /Questions: none/);
+});
+
 test("stage output parsing exposes only the fields its stage owns", () => {
   const research = parseStageOutput("research", "## research\nfacts");
   assert.equal(research.verdict, undefined);

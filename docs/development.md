@@ -22,6 +22,11 @@ Before changing an unfamiliar subsystem, read the matching agent reference: [arc
 | `src/workfile.ts` | The `.kanban/work/<base>.md` section artifact. |
 | `src/artifacts.ts` | Plan JSON (including the bounded archive-time `completion` record) and the single bounded `handoff.md`. |
 | `src/ui.ts` | Themed four-line selected-session widget and title-based keyboard picker. |
+| `src/pipelineprogress.ts` | Ephemeral stage heartbeat, child activity/counts, and bounded process-local timing samples. |
+| `src/liveprogress.ts` | Bounded process-local implement activity/output shared by runner, measurement, and UI; no durable writes. |
+| `src/usage.ts` | Signal-keyed child context estimates and cumulative reported token/cost totals; no durable writes. |
+| `src/progressevents.ts` | Process-local, microtask-coalesced progress notifications; no timers or polling. |
+| `src/status.ts` | Bounded on-demand status/output/results/plan queries for the command and read-only tool. |
 | `init.sh` | Fast session-start report and `--check` completion validation. |
 | `test/store.test.ts` | Schema, migration, lock, agent, filename, and handoff persistence tests. |
 | `test/*.test.ts` | Unit tests per module plus command, checkpoint, stage, gate, UI, title, picker, and resume integration tests. |
@@ -103,9 +108,75 @@ The shared fields are `inScope?: string[]`, `outOfScope?: string[]`, `agents?: {
 
 Kanban launches its own internal child sessions for the pipeline stages and the critique gate (see `src/orchestrator.ts` and `src/runner.ts`); those children appear in the roster with a `Kanban ` prefix while they run. External scheduling tools remain external: they are only named in the implement kickoff when detected. `stage_complete` at critique accepts `rerunCritique` / `acceptRemainingIssues` / `critiqueSummary` per the gate contract in agent-workflow.md.
 
+Planning defaults are `research: { workers: 2, depth: "focused" }`,
+`compose: { detail: "plan" }`, and `pipeline: { childTimeoutMs: 300000 }`.
+Worker groups must cover all three research angles even with fewer workers. Depth/detail limits
+are prompt budgets; only the per-child wait timeout is enforced. Timeout aborts the child signal
+and uses the existing stage failure/manual fallback; successful partial research can still commit.
+The timeout never applies to implement or critique children, or to measurement commands.
+
+Compose uses a Markdown plan with level-3 summary, goals/non-goals, approach, implementation
+steps, validation/acceptance, and risks/assumptions sections (headings may be translated; the
+outer `## compose` stays fixed). `plan` targets 120–240 lines for substantial tasks; small tasks
+stay shorter. `concise` and `detailed` remain compatible with 100-/220-line prompt budgets.
+Before commit, reject a compose body over 299 lines so the heading plus plan fits within 300.
+Use the existing manual fallback without publishing an automatically truncated plan.
+`/kanban plan` is a read-only preview of the recorded compose section and never opens a new conversation.
+
+Grill output adds `Option: label | description` lines to the legacy `Q:`/`Recommended:` grammar.
+The recommended label is reordered first, option descriptions render on a second line, and free
+text is last. Record the selected label and description in the workfile. `Questions: none` is
+intentional; other unparseable output still warns. Questions, options and budgets do not add
+Session fields or additional child turns. Headless/skip/Escape preserve explicit ASSUMED answers.
+
+Child start/finish are roster milestones written under the existing lock. Tool/stream activity
+and the planning-stage heartbeat never write state. In-process children subscribe to Pi session events;
+subprocess children use print mode with JSON events and extract the final assistant message.
+Keep `RunChild`, `ChildSpec`, and `ChildResult` unchanged. Late callbacks and timer cleanup must
+respect abort/run identity so an old run cannot overwrite a new run's status.
+
 ## UI and resume
 
-The selected-session widget is exactly four logical lines: task title, current stage, **current Pi context** remaining bar, and number of agents working. It uses `ctx.getContextUsage().contextWindow/tokens` and `ctx.model.contextWindow`, never `modelContextLimits`. The context cache is keyed by the current Pi conversation, not the Kanban title. When tokens are transiently null after compaction, retain the last observed token count and fall back to zero; do not render `unavailable`.
+The selected-session widget is exactly four logical lines: task title, stage, executor context
+remaining, and agents working. During internal runs the context row names the stage and uses
+child model/usage data. Parallel workers' windows must never be summed: show the lowest remaining
+percentage and identify workers awaiting data, with individual values in `/kanban progress`.
+Otherwise show **Current Pi context**, using `ctx.getContextUsage()` and `ctx.model.contextWindow`.
+The parent context cache remains keyed by Pi conversation. Child caches are signal-keyed; a fresh
+child starts without a token value, and null after compaction retains a marked last-known value.
+Never render `unavailable` or require `modelContextLimits`.
+
+`usage.ts` tracks SDK cumulative cost/token snapshots per child and adds only their deltas.
+Context occupancy is separate from cumulative billed tokens (which include input/output/cache).
+In-process samples come from `getContextUsage()` / `getSessionStats()` at events and completion;
+subprocess samples come from JSON message usage and recorded compaction/summary usage. Repeated
+agent_end messages must not recount message_end usage. The separate `kanban-usage` status line
+and dashboard show estimates from reported pricing, never a promised bill. Missing reports remain
+explicit. Totals cover internal children for this title in the current Pi process, not main-chat
+or title-generation cost. Nothing is injected into native Pi conversation entries to affect its footer.
+Usage events refresh cached UI state. Abort/end cleans up observers and late
+events cannot alter the next run. Up to sixteen titles' totals survive stage changes in memory.
+
+An implement loop additionally shows a separate `kanban-progress` widget while selected and live.
+It is not a fifth board row. `/kanban progress` and `/kanban experiments` open the same detailed
+dashboard, with goal, iteration budget, activity, metrics/trend, decision comments and output.
+↑/↓ browses saved attempts; PgUp/PgDn scrolls the retained output. The live tail is bounded to
+8,000 characters per session and sixteen recent sessions per process, stripped of terminal control
+sequences, never persisted, and contains public assistant text plus measurement output only.
+No chain-of-thought or raw tool-result stream is collected. Signal-keyed observation leaves
+the frozen runner seam unchanged. End/abort freezes the snapshot and removes widget subscriptions;
+closing the expanded dashboard removes its subscriptions without aborting the experiment.
+
+The implement task registers before background preparation and baseline measurement. TUI/RPC
+commands return that handle immediately after preflight; print/json still await its run promise.
+Background failures clean up the handle and report a terminal result. The JavaScript controller
+awaits child/process events; it never runs a model turn or polling loop to monitor work.
+`progressevents.ts` coalesces event types within a microtask, scoped by repository. Live/usage events
+redraw cached data; record events reload the open dashboard's durable snapshot. Idle implement
+observers have no intervals or scheduled callbacks. `r` explicitly refreshes cross-process results.
+`kanban_status` and `/kanban status` query once using `store.readSnapshot`, which never acquires a
+lock, creates a board or migrates state. Queries return bounded summaries/output/results/plans
+without touching the run identity, stage or main conversation. Keep external schedulers external.
 
 `/kanban` opens the shared interactive multi-session dashboard. It must be a non-overlay, bordered editor-area component; do not cover transcript content with an experimental floating overlay. Browse mode previews the highlighted session's status; Enter opens it in a fresh Pi conversation, and Tab enters management mode. Management mode supports Enter to open, `r` to rename, and `x` to permanently delete after confirmation. Rename and delete must reopen the refreshed dashboard; opening a session is the only dashboard action that exits into a new Pi conversation. The fresh-conversation seed states that the global handoff may describe previously selected work and that the selected plan is authoritative. `/kanban pause`, `/kanban unpause`, and `/kanban remove` act only on the current durable selection; remove is permanent and asks for confirmation.
 

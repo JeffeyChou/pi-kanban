@@ -193,7 +193,7 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     sessionManager: { getSessionFile: () => join(cwd, "chat.jsonl") },
     ui: {
       notify: (message: string, type?: string) => notifications.push({ message, type }),
-      setStatus: (_key: string, text: string | undefined) => statuses.push(text),
+      setStatus: (key: string, text: string | undefined) => { if (key === "kanban") statuses.push(text); },
       setWidget: () => {},
       ...options.ui,
     },
@@ -373,11 +373,13 @@ test("grill walks open questions through ui.select/ui.input with the run's abort
     await kanban.run();
     const grillChild = kanban.calls.find((call) => call.stage === "grill")!;
     assert.equal(asked.length, 3);
-    for (const dialog of asked) assert.equal(dialog.signal, grillChild.spec.signal);
+    for (const dialog of asked) assert.equal(dialog.signal, asked[0]!.signal);
+    assert.equal(grillChild.spec.signal.aborted, false);
+    assert.equal(asked[0]!.signal?.aborted, false);
     assert.deepEqual(asked[0]!.options, [
-      "yes, 300 lines",
-      "Answer differently…",
+      "1. yes, 300 lines (Recommended)",
       "Skip (record assumption)",
+      "Answer differently…",
     ]);
     const grill = (await kanban.sections()).grill!;
     assert.match(grill, /Q: Cap the sections\?\nA: yes, 300 lines/);
@@ -400,6 +402,116 @@ test("without a UI the grill recommendations are auto-accepted as assumptions", 
   } finally {
     await kanban.cleanup();
   }
+});
+
+test("grill presents meaningful descriptions, recommendation first and custom answer last", async () => {
+  const kanban = await harness({
+    hasUI: true,
+    script: { grill: () => ok(`## grill
+Q: Research depth?
+Option: Focused | Affected modules and their tests.
+Option: Deep | Trace dependencies; takes longer.
+Recommended: Deep`) },
+    ui: { select: async (title: string, options: string[]) => {
+      assert.match(title, /Grill 1\/1/);
+      assert.equal(options[0], "1. Deep (Recommended)\n   Trace dependencies; takes longer.");
+      assert.equal(options.at(-1), "Answer differently…");
+      return options[1];
+    } },
+  });
+  try {
+    await kanban.run();
+    assert.match((await kanban.sections()).grill!, /A: Focused — Affected modules and their tests\./);
+    assert.match(kanban.calls.find((call) => call.stage === "compose")!.spec.prompt, /A: Focused/);
+    assert(kanban.statuses.some((line) => line?.includes("waiting for answer 1/1")));
+  } finally { await kanban.cleanup(); }
+});
+
+test("an explicit no-question grill continues without warning", async () => {
+  const kanban = await harness({ script: { grill: () => ok("## grill\nQuestions: none") } });
+  try {
+    await kanban.run();
+    assert.equal(kanban.session()?.stage, "implement");
+    assert(!kanban.notifications.some((note) => note.type === "warning"));
+  } finally { await kanban.cleanup(); }
+});
+
+test("one or two research workers cover all three angles", async () => {
+  for (const workers of [1, 2] as const) {
+    const kanban = await harness({ config: { research: { workers, depth: "deep" }, compose: { detail: "detailed" } } });
+    try {
+      await kanban.run();
+      const research = kanban.calls.filter((call) => call.stage === "research");
+      assert.equal(research.length, workers);
+      const prompts = research.map((call) => call.spec.prompt).join("\n");
+      for (const angle of ["repository structure and conventions", "affected code paths and facts", "validation commands and test layout"])
+        assert(prompts.includes(angle));
+      assert.match(prompts, /Deep research/);
+      assert.match(kanban.calls.find((call) => call.stage === "compose")!.spec.prompt, /within 220 lines/);
+      assert(kanban.statuses.some((line) => line?.includes(`${workers}/${workers} finished`)));
+    } finally { await kanban.cleanup(); }
+  }
+});
+
+test("child timeout stops waiting, preserves the stage and ignores late output", async () => {
+  let childSignal: AbortSignal | undefined;
+  const late = deferred<ChildResult>();
+  const kanban = await harness({
+    config: { pipeline: { childTimeoutMs: 25 } },
+    script: { refine: (spec) => { childSignal = spec.signal; return late.promise; } },
+  });
+  const keepAlive = setInterval(() => {}, 1000);
+  try {
+    await kanban.run();
+    assert.equal(childSignal?.aborted, true);
+    assert.equal(kanban.session()?.stage, "refine");
+    assert.equal(kanban.session()?.mode, "manual");
+    assert.match(kanban.notifications.map((note) => note.message).join("\n"), /timed out/);
+    late.resolve(ok(DEFAULT_TEXT.refine!));
+    await Promise.resolve();
+    assert.deepEqual(await kanban.sections(), {});
+    assert.equal(kanban.statuses.at(-1), undefined);
+  } finally { clearInterval(keepAlive); await kanban.cleanup(); }
+});
+
+test("compose accepts a 300-line plan and refuses an oversized plan without publishing truncation", async () => {
+  for (const bodyLines of [299, 300]) {
+    const kanban = await harness({ script: { compose: () => ok(`## compose\n${Array.from({ length: bodyLines }, (_, i) => `step ${i}`).join("\n")}`) } });
+    try {
+      await kanban.run();
+      if (bodyLines === 299) {
+        assert.equal(kanban.session()?.stage, "implement");
+        assert.equal((await kanban.sections()).compose!.split("\n").length, 299);
+      } else {
+        assert.equal(kanban.session()?.stage, "compose");
+        assert.equal(kanban.session()?.mode, "manual");
+        assert.equal((await kanban.sections()).compose, undefined);
+        assert.match(kanban.notifications.map((note) => note.message).join("\n"), /maximum is 300/);
+      }
+    } finally { await kanban.cleanup(); }
+  }
+});
+
+test("research roster and status decrease as individual workers finish", async () => {
+  const pending = deferred<ChildResult>();
+  const started = deferred<void>();
+  const kanban = await harness({ script: { research: (_spec, index) => {
+    if (index === 2) { started.resolve(); return pending.promise; }
+    return ok(DEFAULT_TEXT.research!);
+  } } });
+  try {
+    await startPipeline(kanban.ctx, kanban.title, kanban.deps);
+    await started.promise;
+    for (let i = 0; i < 100 && !kanban.statuses.some((line) => line?.includes("2/3 finished")); i++)
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    // Finish callbacks also commit the roster under the existing lock.
+    for (let i = 0; i < 100 && kanban.session()!.agents.filter((agent) => agent.status === "working" && agent.name.startsWith("Kanban research")).length !== 1; i++)
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(kanban.session()!.agents.filter((agent) => agent.status === "working" && agent.name.startsWith("Kanban research")).length, 1);
+    assert(kanban.statuses.some((line) => line?.includes("1 running · 2/3 finished")));
+    pending.resolve(ok(DEFAULT_TEXT.research!));
+    await pipelineRunFor(kanban.title);
+  } finally { pending.resolve(ok(DEFAULT_TEXT.research!)); await kanban.cleanup(); }
 });
 
 test("an unparseable grill keeps the body, warns, and continues", async () => {

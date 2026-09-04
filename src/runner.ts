@@ -1,12 +1,16 @@
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import type { Model } from "@earendil-works/pi-ai";
 import {
   DefaultResourceLoader,
   createAgentSession,
   getAgentDir,
   SessionManager,
+  type AgentSessionEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { KanbanConfig } from "./config.js";
+import { appendLiveOutput, updateLoopProgress } from "./liveprogress.js";
+import { reportUsage } from "./usage.js";
 
 export type ErrorKind = "spawn" | "model" | "aborted" | "other";
 
@@ -69,11 +73,28 @@ function errorText(error: unknown): string {
 }
 
 function reportStatus(spec: ChildSpec, line: string): void {
+  if (spec.signal.aborted) return;
+  updateLoopProgress(spec.signal, { activity: line });
   try {
     spec.onStatus?.(line);
   } catch {
     // A display callback must not turn child execution into a rejected promise.
   }
+}
+
+/** Report activity categories only, never model thoughts, tool arguments, or output. */
+function eventStatus(event: AgentSessionEvent): string | undefined {
+  if (event.type === "tool_execution_start") return `using ${event.toolName}`;
+  if (event.type === "tool_execution_end") return `${event.toolName} finished; model working`;
+  if (event.type === "turn_start") return "model working";
+  if (event.type === "message_update") {
+    const type = event.assistantMessageEvent.type;
+    if (type === "thinking_delta") return "model thinking";
+    if (type === "text_delta") return "writing findings";
+  }
+  if (event.type === "auto_retry_start") return `retry ${event.attempt}/${event.maxAttempts}`;
+  if (event.type === "compaction_start") return "compacting child context";
+  return undefined;
 }
 
 function abortedResult(): ChildResult {
@@ -115,9 +136,26 @@ export function createInProcessRunner(): RunChild {
             errorMessage?: string;
           }>;
           prompt: (prompt: string) => Promise<void>;
+          subscribe?: (listener: (event: AgentSessionEvent) => void) => () => void;
+          getContextUsage?: () => { tokens: number | null; contextWindow: number } | undefined;
+          getSessionStats?: () => { tokens: { total: number }; cost: number; assistantMessages: number };
         }
       | undefined;
     let onAbort: (() => void) | undefined;
+    let unsubscribe: (() => void) | undefined;
+    let sampledAt = 0;
+    const sampleUsage = () => {
+      try {
+        const context = session?.getContextUsage?.();
+        const stats = session?.getSessionStats?.();
+        // An empty new session has not measured the child prompt yet.
+        if (context && (context.tokens === null || context.tokens > 0 || stats?.assistantMessages))
+          reportUsage(spec.signal, { contextTokens: context.tokens, contextWindow: context.contextWindow });
+        if (stats && (stats.assistantMessages > 0 || stats.tokens.total > 0))
+          reportUsage(spec.signal, { totalTokens: stats.tokens.total, cost: stats.cost });
+      } catch { /* Optional display data must not fail a child. */ }
+      sampledAt = Date.now();
+    };
 
     try {
       const agentDir = spec.agentDir ?? dependencies.getAgentDir();
@@ -155,7 +193,17 @@ export function createInProcessRunner(): RunChild {
       }
 
       reportStatus(spec, "Running in-process child session.");
+      unsubscribe = session.subscribe?.((event) => {
+        if (event.type !== "message_update" || Date.now() - sampledAt >= 1000) sampleUsage();
+        if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta")
+          appendLiveOutput(spec.signal, event.assistantMessageEvent.delta);
+        if (event.type === "message_end" && event.message.role === "assistant")
+          appendLiveOutput(spec.signal, "\n");
+        const line = eventStatus(event);
+        if (line) reportStatus(spec, line);
+      });
       await session.prompt(spec.prompt);
+      sampleUsage();
 
       if (spec.signal.aborted) return abortedResult();
       const final = finalAssistantMessage(session);
@@ -183,6 +231,7 @@ export function createInProcessRunner(): RunChild {
     } finally {
       if (onAbort) spec.signal.removeEventListener("abort", onAbort);
       try {
+        unsubscribe?.();
         session?.dispose();
       } catch {
         // Disposal is best-effort and must not turn a ChildResult into a throw.
@@ -202,6 +251,7 @@ function createSubprocessRunnerFor(piBin: string): RunChild {
 
     const args = [
       "-p",
+      "--mode", "json",
       "--no-extensions",
       "--no-skills",
       "--no-context-files",
@@ -224,7 +274,67 @@ function createSubprocessRunnerFor(piBin: string): RunChild {
       let aborted = false;
       let stdout = "";
       let stderr = "";
+      let pending = "";
+      let finalText = "";
+      let modelError: string | undefined;
+      let sawJson = false;
+      let modelAborted = false;
+      let totalTokens = 0;
+      let totalCost = 0;
+      let costReported = false;
+      let messageEnds = 0;
+      const decoder = new StringDecoder("utf8");
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
       let child: ReturnType<typeof spawn> | undefined;
+
+      const messageUsage = (message: any) => {
+        const usage = message?.usage;
+        if (!usage) return;
+        const values = [usage.input, usage.output, usage.cacheRead, usage.cacheWrite];
+        const tokens = values.every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0)
+          ? values.reduce((sum, value) => sum + value, 0) : undefined;
+        if (tokens !== undefined) totalTokens += tokens;
+        if (typeof usage.cost?.total === "number" && Number.isFinite(usage.cost.total) && usage.cost.total >= 0) {
+          totalCost += usage.cost.total;
+          costReported = true;
+        }
+        reportUsage(spec.signal, {
+          totalTokens,
+          ...(costReported ? { cost: totalCost } : {}),
+          ...(message.role === "assistant" && tokens !== undefined && message.stopReason !== "error" && message.stopReason !== "aborted"
+            ? { contextTokens: tokens, contextWindow: spec.model.contextWindow } : {}),
+        });
+      };
+
+      const consume = (line: string) => {
+        if (!line.trim()) return;
+        try {
+          const event = JSON.parse(line);
+          if (!event || typeof event.type !== "string") return;
+          sawJson = true;
+          if (event.type === "message_end") { messageEnds++; messageUsage(event.message); }
+          // Some backends emit only agent_end; never recount messages when both are present.
+          if (event.type === "agent_end" && messageEnds === 0 && Array.isArray(event.messages)) {
+            for (const message of event.messages) messageUsage(message);
+            messageEnds = event.messages.length;
+          }
+          if (event.type === "entry_appended" && event.entry?.type === "branch_summary")
+            messageUsage(event.entry);
+          if (event.type === "compaction_end" && !event.aborted) {
+            messageUsage(event.result);
+            reportUsage(spec.signal, { contextTokens: null });
+          }
+          const activity = eventStatus(event);
+          if (activity) reportStatus(spec, activity);
+          const message = event.type === "message_end" ? event.message
+            : event.type === "agent_end" ? event.messages?.filter((item: any) => item.role === "assistant").at(-1) : undefined;
+          if (message?.role === "assistant") {
+            finalText = Array.isArray(message.content) ? message.content.filter((item: any) => item.type === "text").map((item: any) => item.text).join("\n") : "";
+            modelError = message.stopReason === "error" ? (message.errorMessage || "child model request failed") : undefined;
+            modelAborted = message.stopReason === "aborted";
+          }
+        } catch { /* Ignore a non-event diagnostic line. */ }
+      };
 
       const finish = (result: ChildResult) => {
         if (settled) return;
@@ -236,6 +346,8 @@ function createSubprocessRunnerFor(piBin: string): RunChild {
         aborted = true;
         try {
           child?.kill();
+          killTimer = setTimeout(() => { try { child?.kill("SIGKILL"); } catch { /* Already gone. */ } }, 2000);
+          killTimer.unref();
         } catch {
           // A process that has already exited needs no additional handling.
         }
@@ -278,10 +390,17 @@ function createSubprocessRunnerFor(piBin: string): RunChild {
 
       reportStatus(spec, "Running subprocess child session.");
       stdoutStream.on("data", (chunk: Buffer | string) => {
-        stdout += chunk.toString();
+        const text = typeof chunk === "string" ? chunk : decoder.write(chunk);
+        stdout = (stdout + text).slice(-16_000);
+        pending += text;
+        let newline: number;
+        while ((newline = pending.indexOf("\n")) >= 0) {
+          consume(pending.slice(0, newline));
+          pending = pending.slice(newline + 1);
+        }
       });
       stderrStream.on("data", (chunk: Buffer | string) => {
-        stderr += chunk.toString();
+        stderr = (stderr + chunk.toString()).slice(-16_000);
       });
       stdinStream.on("error", () => undefined);
       child.on("error", (error: Error) => {
@@ -293,12 +412,16 @@ function createSubprocessRunnerFor(piBin: string): RunChild {
         });
       });
       child.on("close", (code: number | null) => {
+        if (killTimer) clearTimeout(killTimer);
+        consume(pending + decoder.end());
         if (aborted || spec.signal.aborted) {
           finish(abortedResult());
           return;
         }
         if (code === 0) {
-          finish({ text: stdout.trim(), aborted: false });
+          finish(modelAborted ? abortedResult() : modelError
+            ? { text: "", aborted: false, errorKind: "model", error: modelError }
+            : { text: sawJson ? finalText.trim() : stdout.trim(), aborted: false });
           return;
         }
         const output = `${stderr}\n${stdout}`.trim();

@@ -13,7 +13,10 @@ import {
   stagePrompt,
   stageSystemPrompt,
   type ParsedStageOutput,
+  type GrillQuestion,
 } from "./prompts.js";
+import { PipelineProgress } from "./pipelineprogress.js";
+import { appendLiveOutput, endLoopProgress, updateLoopProgress } from "./liveprogress.js";
 import type { ChildResult, ErrorKind, RunChild } from "./runner.js";
 import {
   advanceStage,
@@ -25,7 +28,8 @@ import {
   type Session,
   type Stage,
 } from "./store.js";
-import { refreshWidget } from "./ui.js";
+import { refreshWidget, startUsageDisplay } from "./ui.js";
+import { beginUsage, beginChildUsage, finishChildUsage, endUsage } from "./usage.js";
 import { readWorkfile, workfileBase, writeWorkfileSection } from "./workfile.js";
 
 export interface OrchestratorDeps {
@@ -52,6 +56,7 @@ const CHILD_STAGES: Stage[] = ["refine", "research", "grill", "compose"];
 
 interface RunEntry {
   controller: AbortController;
+  clearStatus?: () => void;
   /** Detached run promise; absent for a critique-gate registration. */
   promise?: Promise<void>;
 }
@@ -73,6 +78,7 @@ export function hasLiveRun(title: string): boolean {
 export function abortPipelineFor(title: string): boolean {
   const entry = runs.get(title);
   if (!entry) return false;
+  entry.clearStatus?.();
   runs.delete(title);
   entry.controller.abort();
   return true;
@@ -82,7 +88,10 @@ export function abortPipelineFor(title: string): boolean {
 export function clearPipelineRegistry(): void {
   const entries = [...runs.values()];
   runs.clear();
-  for (const entry of entries) entry.controller.abort();
+  for (const entry of entries) {
+    entry.clearStatus?.();
+    entry.controller.abort();
+  }
 }
 
 /** ABA guard: only the run that owns the entry may unregister it. */
@@ -102,6 +111,7 @@ interface RunContext {
   token: string;
   signal: AbortSignal;
   deps: OrchestratorDeps;
+  progress?: PipelineProgress;
 }
 
 function childAgent(name: string, role: string): AgentRecord {
@@ -194,6 +204,8 @@ function notifyStop(run: RunContext, stage: Stage, reason: StopReason): void {
 }
 
 function status(run: RunContext, line: string | undefined): void {
+  // A replaced run must never overwrite or clear its successor's status.
+  if (runs.get(run.title)?.controller.signal !== run.signal) return;
   run.ctx.ui.setStatus(STATUS_KEY, line);
 }
 
@@ -247,6 +259,8 @@ async function runStageChild(
     cwd?: string;
     /** Overrides the read-only CHILD_TOOLS — the implement loop passes the write set. */
     tools?: readonly string[];
+    onStatus?: (line: string) => void;
+    timeoutMs?: number;
   },
 ): Promise<ChildOutcome> {
   const resolved = resolveModel(ctx, deps.config, options.modelKey);
@@ -255,16 +269,40 @@ async function runStageChild(
       modelName: resolved.name,
       result: { text: "", aborted: false, errorKind: "model", error: resolved.error },
     };
+  const controller = new AbortController();
+  const signal = options.timeoutMs
+    ? AbortSignal.any([options.signal, controller.signal])
+    : options.signal;
+  beginChildUsage(options.signal, signal, options.stage, options.label, resolved.model);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  if (options.timeoutMs) {
+    timeout = setTimeout(() => { timedOut = true; controller.abort(); }, options.timeoutMs);
+    timeout.unref();
+  }
+  let stopWaiting: (() => void) | undefined;
   try {
-    const result = await deps.runChild({
+    const cancelled = new Promise<ChildResult>((resolve) => {
+      stopWaiting = () => resolve({ text: "", aborted: true, errorKind: "aborted" });
+      signal.addEventListener("abort", stopWaiting, { once: true });
+      if (signal.aborted) stopWaiting();
+    });
+    const child = deps.runChild({
       cwd: options.cwd ?? ctx.cwd,
       prompt: options.prompt,
       systemPrompt: stageSystemPrompt(options.stage),
       model: resolved.model,
       tools: [...(options.tools ?? CHILD_TOOLS)],
-      signal: options.signal,
-      onStatus: (line) => ctx.ui.setStatus(STATUS_KEY, `kanban ${options.label}: ${line}`),
+      signal,
+      onStatus: (line) => {
+        if (signal.aborted) return;
+        if (options.onStatus) options.onStatus(line);
+        else ctx.ui.setStatus(STATUS_KEY, `kanban ${options.label}: ${line}`);
+      },
     });
+    const result = options.timeoutMs ? await Promise.race([child, cancelled]) : await child;
+    if (timedOut && !options.signal.aborted)
+      return { modelName: resolved.name, result: { text: "", aborted: false, errorKind: "other", error: `child timed out after ${options.timeoutMs! / 1000}s; adjust pipeline.childTimeoutMs or reduce research.depth / compose.detail` } };
     return { result, modelName: resolved.name };
   } catch (error: unknown) {
     return {
@@ -276,7 +314,22 @@ async function runStageChild(
         error: error instanceof Error ? error.message : String(error),
       },
     };
+  } finally {
+    finishChildUsage(signal);
+    if (timeout) clearTimeout(timeout);
+    if (stopWaiting) signal.removeEventListener("abort", stopWaiting);
   }
+}
+
+/** Child completion is a roster milestone, never a per-tool state write. */
+async function finishChild(run: RunContext, stage: Stage, name: string, failed: boolean): Promise<void> {
+  run.progress?.finish(name, failed);
+  const updated = await guardedMutate(run, stage, async (_state, session) => {
+    const agent = session.agents.find((item) => item.name === `${CHILD_AGENT_PREFIX}${name}`);
+    if (agent) agent.status = "idle";
+    await syncPlan(run.ctx.cwd, session);
+  });
+  if (updated.ok) await refreshWidget(run.ctx, updated.state);
 }
 
 /** D5: durable flip to manual mode (locked, revalidated) + notify with errorKind and model. */
@@ -380,19 +433,24 @@ async function runSingleChildStage(
   const context = await stageContext(run, session);
   if (!(await announceChildren(run, stage, [childAgent(`${stage} child`, `${stage} stage`)])))
     return undefined;
-  status(run, `kanban ${stage}: running child session`);
+  const label = `${stage} child`;
+  run.progress?.start(label);
   const outcome = await runStageChild(run.ctx, run.deps, {
     stage,
     modelKey: stage,
     label: stage,
     signal: run.signal,
+    timeoutMs: run.deps.config.pipeline?.childTimeoutMs ?? 300_000,
+    onStatus: (line) => run.progress?.activity(label, line),
     prompt: stagePrompt(stage, {
       prompt: context.prompt,
       title: run.title,
       sections: context.sections,
+      composeDetail: run.deps.config.compose?.detail ?? "plan",
       ...extra,
     }),
   });
+  await finishChild(run, stage, label, childFailed(outcome.result));
   if (childFailed(outcome.result)) {
     if (outcome.result.aborted || run.signal.aborted) return undefined;
     await flipToManual(run, stage, {
@@ -445,41 +503,49 @@ async function driveResearch(run: RunContext, session: Session): Promise<boolean
     RESEARCH_ANGLE_LABELS.length,
     Math.max(1, run.deps.config.research.workers),
   );
-  const angles = ([1, 2, 3] as const).slice(0, workers);
+  const groups: Array<Array<1 | 2 | 3>> = workers === 1 ? [[1, 2, 3]]
+    : workers === 2 ? [[1, 2], [3]] : [[1], [2], [3]];
+  const labels = groups.map((angles) => `research angle ${angles.join("+")}`);
   if (
     !(await announceChildren(
       run,
       "research",
-      angles.map((angle) =>
-        childAgent(`research angle ${angle}`, RESEARCH_ANGLE_LABELS[angle - 1]!),
+      groups.map((angles, index) =>
+        childAgent(labels[index]!, angles.map((angle) => RESEARCH_ANGLE_LABELS[angle - 1]).join("; ")),
       ),
     ))
   )
     return false;
-  status(run, `kanban research: ${workers} parallel child sessions`);
+  for (const label of labels) run.progress?.start(label);
   const settled = await Promise.allSettled(
-    angles.map((angle) =>
-      runStageChild(run.ctx, run.deps, {
+    groups.map(async (angles, index) => {
+      const label = labels[index]!;
+      const outcome = await runStageChild(run.ctx, run.deps, {
         stage: "research",
         modelKey: "research",
-        label: `research angle ${angle}`,
+        label,
         signal: run.signal,
+        timeoutMs: run.deps.config.pipeline?.childTimeoutMs ?? 300_000,
+        onStatus: (line) => run.progress?.activity(label, line),
         prompt: stagePrompt("research", {
           prompt: context.prompt,
           title: run.title,
           sections: context.sections,
-          researchAngle: angle,
+          ...(angles.length === 1 ? { researchAngle: angles[0] } : { researchAngles: angles }),
+          researchDepth: run.deps.config.research.depth ?? "focused",
         }),
-      }),
-    ),
+      });
+      await finishChild(run, "research", label, childFailed(outcome.result));
+      return outcome;
+    }),
   );
 
   const parts: string[] = [];
   let succeeded = 0;
   let aborted = false;
   let failure: { errorKind: ErrorKind; error?: string; modelName: string } | undefined;
-  for (const [index, angle] of angles.entries()) {
-    const label = `### Angle ${angle} — ${RESEARCH_ANGLE_LABELS[angle - 1]}`;
+  for (const [index, angles] of groups.entries()) {
+    const label = `### Angle ${angles.join("+")} — ${angles.map((angle) => RESEARCH_ANGLE_LABELS[angle - 1]).join("; ")}`;
     const item = settled[index]!;
     if (item.status === "rejected") {
       failure ??= {
@@ -517,6 +583,8 @@ async function driveResearch(run: RunContext, session: Session): Promise<boolean
     );
     return false;
   }
+  if (succeeded < groups.length && !run.signal.aborted)
+    run.ctx.ui.notify(`Kanban research: ${succeeded}/${groups.length} workers succeeded; missing coverage is recorded for grill and compose.`, "warning");
   const committed = await commitStage(run, "research", parts.join("\n\n"));
   return committed.ok;
 }
@@ -526,19 +594,26 @@ const SKIP_QUESTION = "Skip (record assumption)";
 
 async function collectGrillAnswers(
   run: RunContext,
-  questions: Array<{ q: string; recommended: string }>,
+  questions: GrillQuestion[],
 ): Promise<{ text: string; aborted: boolean }> {
   const lines: string[] = [];
-  for (const question of questions) {
+  for (const [index, question] of questions.entries()) {
+    run.progress?.question(index + 1, questions.length);
     if (run.signal.aborted) return { text: lines.join("\n"), aborted: true };
     lines.push(`Q: ${question.q}`);
     if (!run.ctx.hasUI) {
       lines.push(`A: ASSUMED: ${question.recommended}`, "");
       continue;
     }
+    const alternatives = [...(question.options ?? [])];
+    // Preserve legacy Q:/Recommended: output without inventing alternative answers.
+    if (!alternatives.some((option) => option.label === question.recommended))
+      alternatives.unshift({ label: question.recommended, description: "" });
+    const ordered = [...alternatives].sort((a, b) => Number(b.label === question.recommended) - Number(a.label === question.recommended));
+    const displays = ordered.map((option, optionIndex) => `${optionIndex + 1}. ${option.label}${option.label === question.recommended ? " (Recommended)" : ""}${option.description ? `\n   ${option.description}` : ""}`);
     const choice = await run.ctx.ui.select(
-      question.q,
-      [question.recommended, ANSWER_DIFFERENTLY, SKIP_QUESTION],
+      `Grill ${index + 1}/${questions.length}: ${question.q}`,
+      [...displays, SKIP_QUESTION, ANSWER_DIFFERENTLY],
       { signal: run.signal },
     );
     if (run.signal.aborted) return { text: lines.join("\n"), aborted: true };
@@ -557,7 +632,10 @@ async function collectGrillAnswers(
       );
       continue;
     }
-    lines.push(`A: ${choice}`, "");
+    const selected = ordered[displays.indexOf(choice)];
+    lines.push(selected
+      ? `A: ${selected.label}${selected.description ? ` — ${selected.description}` : ""}`
+      : `A: ASSUMED: ${question.recommended}`, "");
   }
   return { text: lines.join("\n").trim(), aborted: false };
 }
@@ -569,7 +647,7 @@ async function driveGrill(
   const parsed = await runSingleChildStage(run, session, "grill");
   if (!parsed) return { ok: false };
   const questions = parsed.questions ?? [];
-  if (!questions.length)
+  if (!questions.length && !/^\s*Questions:\s*none\s*$/im.test(parsed.body))
     run.ctx.ui.notify(
       `Kanban grill for “${run.title}” produced no parseable Q:/Recommended: pairs; its findings were recorded without a user walkthrough.`,
       "warning",
@@ -590,13 +668,21 @@ async function driveCompose(
 ): Promise<boolean> {
   const parsed = await runSingleChildStage(run, session, "compose", { grillAnswers });
   if (!parsed) return false;
+  const lines = parsed.body.split(/\r?\n/).length + 1;
+  if (lines > 300) {
+    await flipToManual(run, "compose", {
+      errorKind: "other", modelName: resolveModel(run.ctx, run.deps.config, "compose").name,
+      error: `compose plan has ${lines} lines; maximum is 300 including its heading. Shorten the plan before implementation; no truncated plan was published`,
+    });
+    return false;
+  }
   const committed = await commitStage(run, "compose", parsed.body);
   if (!committed.ok) return false;
   run.ctx.ui.notify(
-    `Kanban pipeline composed the spec for “${run.title}”. Run /kanban open (or press Enter on the session in /kanban) to start implementation.`,
+    `Kanban pipeline composed the spec for “${run.title}”. Review it with /kanban plan. Run /kanban open (or press Enter on the session in /kanban) to start implementation.`,
     "info",
   );
-  return false;
+  return true;
 }
 
 async function runPipeline(run: RunContext, entry: RunEntry): Promise<void> {
@@ -612,20 +698,37 @@ async function runPipeline(run: RunContext, entry: RunEntry): Promise<void> {
       }
       const session = checked.session;
       if (!CHILD_STAGES.includes(session.stage)) return;
-      status(run, `kanban: ${session.stage} stage`);
-      if (session.stage === "refine") {
-        if (!(await driveRefine(run, session))) return;
-      } else if (session.stage === "research") {
-        if (!(await driveResearch(run, session))) return;
-      } else if (session.stage === "grill") {
-        const outcome = await driveGrill(run, session);
-        if (!outcome.ok) return;
-        grillAnswers = outcome.answers;
-      } else if (!(await driveCompose(run, session, grillAnswers))) return;
+      const next = { refine: "research", research: "grill", grill: "compose", compose: "implement" }[session.stage as "refine" | "research" | "grill" | "compose"];
+      const timingKey = JSON.stringify([run.ctx.cwd, session.stage, run.deps.config.models[session.stage] ?? `${run.ctx.model?.provider}:${run.ctx.model?.id}`, run.deps.config.research, run.deps.config.compose]);
+      const progress = new PipelineProgress(session.stage, next, timingKey,
+        run.deps.config.pipeline?.childTimeoutMs ?? 300_000, (line) => status(run, line));
+      run.progress = progress;
+      const stopProgress = () => progress.stop(false);
+      run.signal.addEventListener("abort", stopProgress, { once: true });
+      let succeeded = false;
+      try {
+        if (session.stage === "refine") {
+          succeeded = await driveRefine(run, session);
+        } else if (session.stage === "research") {
+          succeeded = await driveResearch(run, session);
+        } else if (session.stage === "grill") {
+          const outcome = await driveGrill(run, session);
+          succeeded = outcome.ok;
+          grillAnswers = outcome.answers;
+        } else {
+          succeeded = await driveCompose(run, session, grillAnswers);
+          return;
+        }
+        if (!succeeded) return;
+      } finally {
+        progress.stop(succeeded);
+        run.signal.removeEventListener("abort", stopProgress);
+      }
     }
   } finally {
-    unregister(run.title, entry);
+    endUsage(run.signal);
     status(run, undefined);
+    unregister(run.title, entry);
   }
 }
 
@@ -713,8 +816,10 @@ export async function startPipeline(
     return;
   }
   await refreshWidget(ctx, minted.state);
-  const entry: RunEntry = { controller: new AbortController() };
+  const entry: RunEntry = { controller: new AbortController(), clearStatus: () => ctx.ui.setStatus(STATUS_KEY, undefined) };
   runs.set(title, entry);
+  beginUsage(ctx.cwd, title, entry.controller.signal);
+  const stopUsageDisplay = startUsageDisplay(ctx, entry.controller.signal);
   const run: RunContext = {
     ctx,
     title,
@@ -728,7 +833,7 @@ export async function startPipeline(
       `Kanban pipeline for “${title}” stopped: ${error instanceof Error ? error.message : String(error)}`,
       "error",
     );
-  });
+  }).finally(stopUsageDisplay);
   // Single-shot (`pi -p "/kanban create …"`): print/json mode disposes the runtime as soon as
   // the command returns, so an armed-but-unawaited pipeline would be killed mid-stage. An
   // interactive session must not block here — the pipeline reports into that conversation.
@@ -823,8 +928,10 @@ export async function armImplementLoop(
   if (!minted.ok) return { ok: false, message: minted.message, kind: minted.kind };
   await refreshWidget(ctx, minted.state);
 
-  const entry: RunEntry = { controller: new AbortController() };
+  const entry: RunEntry = { controller: new AbortController(), clearStatus: () => ctx.ui.setStatus(STATUS_KEY, undefined) };
   runs.set(title, entry);
+  beginUsage(ctx.cwd, title, entry.controller.signal);
+  const stopUsageDisplay = startUsageDisplay(ctx, entry.controller.signal);
   const run: RunContext = {
     ctx,
     title,
@@ -850,8 +957,9 @@ export async function armImplementLoop(
       mutate: (expected, body) => guardedMutate(run, expected, body),
       commit: (stage, body, patch) => commitStage(run, stage, body, patch),
       agents: (stage, agents) => announceChildren(run, stage, agents),
-      child: (options) =>
-        runStageChild(ctx, run.deps, {
+      child: async (options) => {
+        updateLoopProgress(run.signal, { childRunning: true, activity: options.label, output: "" });
+        const outcome = await runStageChild(ctx, run.deps, {
           stage: "implement",
           modelKey: "implement",
           prompt: options.prompt,
@@ -859,13 +967,24 @@ export async function armImplementLoop(
           label: options.label,
           cwd: options.cwd,
           tools: options.tools,
-        }),
-      status: (line) => status(run, line),
+          onStatus: (line) => updateLoopProgress(run.signal, { activity: `${options.label}: ${line}` }),
+        });
+        updateLoopProgress(run.signal, { childRunning: false, activity: "child finished; capturing candidate" });
+        appendLiveOutput(run.signal, `\n[Final child output]\n${outcome.result.text}\n`);
+        return outcome;
+      },
+      status: (line) => {
+        if (line) updateLoopProgress(run.signal, { activity: line });
+        status(run, line);
+      },
       notify: (message, kind) => ctx.ui.notify(message, kind),
       track: (promise) => {
         entry.promise = promise;
       },
       release: () => {
+        endUsage(run.signal);
+        stopUsageDisplay();
+        endLoopProgress(run.signal);
         status(run, undefined);
         unregister(title, entry);
       },
@@ -929,6 +1048,9 @@ export async function runCritiqueGate(
   const bridge = () => entry.controller.abort();
   deps.signal.addEventListener("abort", bridge, { once: true });
   runs.set(session.title, entry);
+  beginUsage(ctx.cwd, session.title, entry.controller.signal);
+  beginChildUsage(entry.controller.signal, entry.controller.signal, "critique", "critique child", resolved.model);
+  const stopUsageDisplay = startUsageDisplay(ctx, entry.controller.signal);
   try {
     const [plan, sections] = await Promise.all([
       readPlan(ctx.cwd, session.planPath),
@@ -974,6 +1096,9 @@ export async function runCritiqueGate(
       error: error instanceof Error ? error.message : String(error),
     };
   } finally {
+    finishChildUsage(entry.controller.signal);
+    endUsage(entry.controller.signal);
+    stopUsageDisplay();
     deps.signal.removeEventListener("abort", bridge);
     unregister(session.title, entry);
   }
