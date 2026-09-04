@@ -77,7 +77,7 @@ Stages are a communication and review structure. In pipeline mode, stages `refin
 | Stage | Owner | Agent outcome before completion |
 | --- | --- | --- |
 | `refine` | pipeline child | Clear goal, audience, scope, constraints, and success criteria, plus a `Verdict: simple|standard` (fast path). |
-| `research` | pipeline (N parallel child workers) | Verify repository facts, relevant APIs, and external constraints; one angle per worker. |
+| `research` | pipeline (N parallel child workers) | Verify repository facts, relevant APIs, and external constraints; all three angles are covered, grouped when fewer than three workers run. |
 | `grill` | pipeline child + orchestrator Q&A | Challenge assumptions, failure modes, compatibility, and safety; open questions answered or assumed. |
 | `compose` | pipeline child | Produce a decision-complete implementation spec (`## compose`). |
 | `implement` | main conversation, or the loop when `config.loop.enabled` | Execute the spec and validate the agreed change; the workfile spec and plan are the authority. With the loop enabled, `/kanban implement` runs autoresearch iterations in disposable git worktrees: accepted candidates are committed on `kanban-autoresearch/<base>`, reverted candidates leave durable lessons, and the final branch diff lands uncommitted in the user checkout for critique. |
@@ -90,6 +90,35 @@ A `stage_complete` result carries the next stage's transition prompt in its resu
 ### Fast path
 
 When the refine child returns a `simple` verdict and `fastPath` is enabled, the pipeline runs refine → compose directly and skips research and grill; the justification is recorded in `plan.work.done` and the `## refine` section. With `fastPath: false` (or any non-simple verdict) no stage is skipped. There is no `skipRemaining` parameter anywhere.
+
+### Planning and implementation progress
+
+Planning reports elapsed time, running/finished children, activity age and an approximate ETA
+from successful runs in the current process. No history means no ETA. Child waits default to
+five minutes; `pipeline.childTimeoutMs` changes that without limiting expensive implement
+measurements. Research depth and compose detail are independently configurable. Focused research
+feeds a structured compose plan with goals, approach, ordered steps, validation and risks. The
+plan including its heading is capped at 300 lines; routine coding choices remain with implementation.
+Use `/kanban plan` to review the recorded plan before starting implementation.
+
+During internal runs the context row follows the stage's child; parallel research shows the
+lowest remaining percentage, with separate workers visible in `/kanban progress`. Kanban's
+child-cost status reports stage and process-local tracked totals. Pi's native footer continues
+to account for the main conversation. Usage estimates update when Pi/provider data arrives;
+awaiting reports and post-compaction cached values are labeled explicitly.
+
+During an implement loop, the separate live widget shows the goal, current activity, metric
+comparison and latest decision. `/kanban progress` or `/kanban experiments` opens the detailed
+view and output tail. Closing it leaves the loop running. Stop with `/kanban implement stop`.
+The loop (including baseline measurement) runs as a background task in the current Pi process.
+When the user asks for progress, call `kanban_status` once, using `view: "output"` or
+`view: "results"` and optionally `iteration` when needed. Answer the question and leave the task
+running; do not poll, sleep in a monitoring loop, or start implementing in the main conversation.
+`/kanban status` provides the same snapshot directly. Implement UI updates are event-driven;
+press `r` in the dashboard to refresh saved results from another process.
+Iteration count measures attempts, not goal completion. When implementation is agent-owned,
+the same dashboard shows saved checkpoints and agents; read actual output in the main
+conversation or the external scheduler that owns the child.
 
 ### The critique gate
 

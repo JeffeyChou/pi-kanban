@@ -48,7 +48,7 @@ test("config layers use defaults, then agent configuration, then repository conf
       critique: "project:review",
     });
     assert.equal(loaded.config.fastPath, true);
-    assert.deepEqual(loaded.config.research, { workers: 2 });
+    assert.deepEqual(loaded.config.research, { workers: 2, depth: "focused" });
     assert.equal(loaded.config.runner, "subprocess");
     assert.equal(loaded.config.piBin, "agent-pi");
     assert.deepEqual(loaded.config.init, { check: "verify-project" });
@@ -235,7 +235,7 @@ test("config validation ignores unknown and invalid values while reporting warni
     );
     const loaded = await loadConfig(cwd, agentDir);
     assert.equal(loaded.config.models.refine, null);
-    assert.equal(loaded.config.research.workers, 3);
+    assert.equal(loaded.config.research.workers, 2);
     assert.equal(loaded.config.critique, true);
     assert.deepEqual(loaded.config.init, {});
     assert.equal(loaded.warnings.length, 8);
@@ -284,4 +284,27 @@ test("configured models resolve through the parent registry and malformed specs 
   assert.equal(resolveConfigModel(ctx as any, "configured:model"), expected);
   assert.equal(resolveConfigModel(ctx as any, "missing-colon"), undefined);
   assert.equal(resolveConfigModel(ctx as any, "configured:"), undefined);
+});
+
+test("planning controls merge independently and reject invalid depth/detail/timeouts", async () => {
+  const cwd = await sandbox();
+  const agentDir = join(cwd, "agent");
+  try {
+    await mkdir(join(agentDir, "extensions"), { recursive: true });
+    await mkdir(join(cwd, ".kanban"), { recursive: true });
+    const defaultConfig = (await loadConfig(cwd, agentDir)).config;
+    assert.deepEqual(defaultConfig.compose, { detail: "plan" });
+    assert.deepEqual(defaultConfig.pipeline, { childTimeoutMs: 300_000 });
+    await writeFile(join(agentDir, "extensions", "kanban.json"), JSON.stringify({
+      research: { workers: 1, depth: "deep" }, compose: { detail: "detailed" }, pipeline: { childTimeoutMs: 600_000 },
+    }));
+    await writeFile(join(cwd, ".kanban", "config.json"), JSON.stringify({
+      research: { workers: 2, depth: "invalid" }, compose: { detail: null, extra: true }, pipeline: { childTimeoutMs: -1 },
+    }));
+    const loaded = await loadConfig(cwd, agentDir);
+    assert.deepEqual(loaded.config.research, { workers: 2, depth: "deep" });
+    assert.deepEqual(loaded.config.compose, { detail: "detailed" });
+    assert.deepEqual(loaded.config.pipeline, { childTimeoutMs: 600_000 });
+    assert.equal(loaded.warnings.length, 4);
+  } finally { await rm(cwd, { recursive: true, force: true }); }
 });

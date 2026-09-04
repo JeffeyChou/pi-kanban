@@ -10,6 +10,12 @@ import {
   type LoopIterationRecord,
   type LoopRunManifest,
 } from "./looplog.js";
+import { readPlan, type PlanSnapshot } from "./artifacts.js";
+import { loadConfig } from "./config.js";
+import { displayText, loopProgress, type LiveLoopProgress } from "./liveprogress.js";
+import { getUsage, usageLines } from "./usage.js";
+import { readWorkfile, workfileBase } from "./workfile.js";
+import { publishProgress, subscribeProgress } from "./progressevents.js";
 
 interface LiveWidgetState {
   contextWindow: number;
@@ -29,6 +35,53 @@ interface WidgetSnapshot {
 
 const lastKnownTokens = new Map<string, number>();
 const MAX_VISIBLE_SESSIONS = 6;
+const selectedForWidget = new Map<string, string | undefined>();
+const loopWidgets = new Map<string, () => void>();
+const widgetStates = new Map<string, KanbanState>();
+
+function contextRow(ctx: ExtensionContext, view: WidgetSnapshot): { text: string; percent: number } {
+  const usage = getUsage(ctx.cwd, view.title);
+  if (usage?.active && usage.stage === view.stage && usage.children.length) {
+    const active = usage.children.filter((child) => child.active);
+    const candidates = active.length ? active : usage.children;
+    const known = candidates.filter((child) => child.contextTokens !== undefined && child.contextWindow > 0);
+    const pending = candidates.length - known.length;
+    const label = `${view.stage} context${candidates.length > 1 ? " (min)" : " (child)"}`;
+    if (!known.length) return { text: `  ${label} · awaiting usage`, percent: 100 };
+    const child = known.reduce((worst, item) =>
+      (item.contextTokens! / item.contextWindow) > (worst.contextTokens! / worst.contextWindow) ? item : worst);
+    const remaining = Math.max(0, child.contextWindow - child.contextTokens!);
+    const percent = Math.round(100 * remaining / child.contextWindow);
+    return {
+      text: `  ${label} ${bar(percent)} ${remaining.toLocaleString()} / ${child.contextWindow.toLocaleString()} · ${percent}% remaining${child.contextStale ? " · last known (compacted)" : " · est."}${pending ? ` · ${pending} awaiting usage` : ""}`,
+      percent,
+    };
+  }
+  return {
+    text: `  Current Pi context  ${bar(view.percent)} ${view.remaining.toLocaleString()} / ${view.contextWindow.toLocaleString()} · ${view.percent}% remaining`,
+    percent: view.percent,
+  };
+}
+
+/** Refresh on child usage events. A quiet run has no scheduled UI work. */
+export function startUsageDisplay(ctx: ExtensionContext, signal: AbortSignal): () => void {
+  let stopped = false;
+  const refresh = () => {
+    const state = widgetStates.get(ctx.cwd);
+    if (state) void refreshWidget(ctx, state).catch(() => {});
+  };
+  const unsubscribe = subscribeProgress(ctx.cwd, (events) => { if (events.has("usage")) refresh(); });
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    unsubscribe();
+    signal.removeEventListener("abort", stop);
+    refresh();
+  };
+  signal.addEventListener("abort", stop, { once: true });
+  if (signal.aborted) stop();
+  return stop;
+}
 
 function conversationKey(ctx: ExtensionContext): string {
   return ctx.sessionManager.getSessionFile() ?? "__ephemeral_pi_conversation__";
@@ -145,7 +198,13 @@ export async function refreshWidget(
   ctx: ExtensionContext,
   state: KanbanState,
 ): Promise<void> {
+  widgetStates.set(ctx.cwd, state);
+  if (selectedForWidget.get(ctx.cwd) !== state.selectedSessionTitle)
+    publishProgress(ctx.cwd, "selection");
+  selectedForWidget.set(ctx.cwd, state.selectedSessionTitle);
   const view = snapshot(state, liveWidgetState(ctx));
+  const usage = view ? getUsage(ctx.cwd, view.title) : undefined;
+  ctx.ui.setStatus?.("kanban-usage", usage ? usageLines(usage)[0] : undefined);
   if (!view) {
     ctx.ui.setWidget("kanban", ["No active Kanban session. Use /kanban create <prompt>."], {
       placement: "aboveEditor",
@@ -156,14 +215,14 @@ export async function refreshWidget(
     "kanban",
     (_tui, theme) => ({
       render: (width: number) => {
-        const percentage = `${view.percent}% remaining`;
-        const context = `  Current Pi context  ${bar(view.percent)} ${view.remaining.toLocaleString()} / ${view.contextWindow.toLocaleString()} · ${percentage}`;
+        const current = snapshot(state, liveWidgetState(ctx)) ?? view;
+        const context = contextRow(ctx, current);
         const stage = `  ◉ Stage ${view.stageNumber}/${STAGES.length} · ${view.stage}`;
         const agents = `  ● Agents working ${view.agentsWorking}`;
         return [
           theme.fg("accent", theme.bold(truncate(`☐ ${view.title}`, width))),
           theme.fg("accent", truncate(stage, width)),
-          theme.fg(contextColor(view.percent), truncate(context, width)),
+          theme.fg(contextColor(context.percent), truncate(context.text, width)),
           theme.fg(
             view.agentsWorking ? "success" : "dim",
             truncate(agents, width),
@@ -174,6 +233,70 @@ export async function refreshWidget(
     }),
     { placement: "aboveEditor" },
   );
+}
+
+function elapsedText(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+export function renderLoopProgress(progress: LiveLoopProgress): string[] {
+  const metric = progress.metricName ?? "metric";
+  return [
+    `Goal: ${progress.goal.replace(/\s+/g, " ")}`,
+    `Iteration ${progress.iteration}/${progress.maxIterations} (attempt budget) · ${progress.childRunning ? 1 : 0} child running · ${elapsedText((progress.active ? Date.now() : progress.updatedAt) - progress.startedAt)} elapsed`,
+    `${metric}: baseline ${progress.baseline ?? "—"} · latest ${progress.latest ?? "—"} · best ${progress.best ?? "—"} · target ${progress.target ?? "not set"} · ${progress.direction} is better`,
+    `${progress.activity} · activity ${elapsedText(Date.now() - progress.updatedAt)} ago`,
+    progress.comment ? `Decision: ${progress.comment}` : "Awaiting the first measured decision",
+    `Output: ${progress.output.trim().split("\n").at(-1) || "waiting for child or measurement output"}`,
+  ].map(displayText);
+}
+
+/** A separate implement panel; the board widget stays four rows. */
+export function startLoopWidget(ctx: ExtensionCommandContext, base: string, signal: AbortSignal): void {
+  if (!ctx.hasUI || signal.aborted) return;
+  loopWidgets.get(ctx.cwd)?.();
+  let stopped = false;
+  const render = () => {
+    const live = loopProgress(ctx.cwd, base);
+    if (!live?.active) { stop(); return; }
+    if (selectedForWidget.get(ctx.cwd) !== live.title) {
+      ctx.ui.setWidget("kanban-progress", undefined);
+      return;
+    }
+    ctx.ui.setWidget("kanban-progress", (_tui, theme) => ({
+      render: (width) => panelLines("Implement · /kanban progress for details", renderLoopProgress(live), width)
+        .map((line, index) => index === 0 ? theme.fg("accent", line) : line),
+      invalidate: () => {},
+    }), { placement: "aboveEditor" });
+  };
+  const unsubscribe = subscribeProgress(ctx.cwd, (events) => {
+    if (events.has("live") || events.has("selection")) render();
+  });
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    unsubscribe();
+    signal.removeEventListener("abort", stop);
+    if (loopWidgets.get(ctx.cwd) === stop) {
+      loopWidgets.delete(ctx.cwd);
+      ctx.ui.setWidget("kanban-progress", undefined);
+    }
+  };
+  loopWidgets.set(ctx.cwd, stop);
+  signal.addEventListener("abort", stop, { once: true });
+  render();
+}
+
+function wrapped(text: string, width: number): string[] {
+  const result: string[] = [];
+  const limit = Math.max(10, width - 4);
+  for (const line of displayText(text).split("\n")) {
+    const chars = Array.from(line);
+    if (!chars.length) result.push("");
+    while (chars.length) result.push(chars.splice(0, limit).join(""));
+  }
+  return result;
 }
 
 export async function showDashboard(
@@ -278,51 +401,89 @@ export async function showDashboard(
 
 /**
  * A live, explicit experiment table. It intentionally is not another selected-session widget
- * row: the compact four-line widget remains the low-noise board summary while this panel polls
- * the append-only durable experiment log.
+ * row: live events redraw cached data; durable iteration events reload the experiment log.
  */
 export async function showExperimentDashboard(
   ctx: ExtensionCommandContext,
   base: string,
+  session?: Session,
 ): Promise<void> {
   if (!ctx.hasUI) {
     ctx.ui.notify("Kanban experiment dashboard requires an interactive Pi UI.", "info");
     return;
   }
+  const config = (await loadConfig(ctx.cwd)).config;
   await ctx.ui.custom<void>((tui, theme, keys, done) => {
     let manifest: LoopRunManifest | undefined;
+    let plan: PlanSnapshot | undefined;
     let records: LoopIterationRecord[] = [];
     let closed = false;
+    let refreshing = false;
+    let refreshAgain = false;
+    let offset = 0;
+    let outputOffset = 0;
+    let outputLines = 0;
     const refresh = async () => {
-      const [nextManifest, nextRecords] = await Promise.all([
+      if (closed) return;
+      if (refreshing) { refreshAgain = true; return; }
+      refreshing = true;
+      const [nextManifest, nextRecords, nextPlan] = await Promise.all([
         readLoopRun(ctx.cwd, base),
         readLoopLog(ctx.cwd, base),
-      ]).catch((): [LoopRunManifest | undefined, LoopIterationRecord[]] => [undefined, []]);
+        session ? readPlan(ctx.cwd, session.planPath) : Promise.resolve(undefined),
+      ]).catch((): [LoopRunManifest | undefined, LoopIterationRecord[], PlanSnapshot | undefined] => [undefined, [], undefined]);
+      refreshing = false;
       if (closed) return;
       manifest = nextManifest;
       records = nextRecords;
+      plan = nextPlan;
       tui.requestRender();
+      if (refreshAgain) { refreshAgain = false; void refresh(); }
     };
-    const timer = setInterval(() => void refresh(), 750);
+    const unsubscribe = subscribeProgress(ctx.cwd, (events) => {
+      if (closed) return;
+      if (events.has("records")) void refresh();
+      else tui.requestRender();
+    });
     void refresh();
     const finish = () => {
       if (closed) return;
       closed = true;
-      clearInterval(timer);
+      unsubscribe();
       done(undefined);
     };
     return {
       render: (width) => {
+        const live = loopProgress(ctx.cwd, base);
+        const usage = session ? getUsage(ctx.cwd, session.title) : undefined;
+        const latest = records.at(-1);
+        const chosen = records[Math.max(0, records.length - 1 - offset)];
+        const values = records.filter((record) => record.metric !== undefined).slice(-12).map((record) => record.metric!);
+        const low = Math.min(...values), high = Math.max(...values);
+        const trend = values.map((value) => "▁▂▃▄▅▆▇█"[high === low ? 3 : Math.round((value - low) / (high - low) * 7)]).join("");
+        const output = wrapped(live?.output || latest?.validationTail || "No captured output yet.", width);
+        outputLines = output.length;
+        outputOffset = Math.min(outputOffset, Math.max(0, outputLines - 6));
         const rows = [
+          ...wrapped(`Goal: ${live?.goal || plan?.prompt || session?.title || base}`, width).slice(0, 5),
+          ...(usage ? usageLines(usage) : []),
+          ...(live ? renderLoopProgress(live).slice(1, 5) : [
+            manifest ? "No live child telemetry in this Pi process; showing saved results."
+              : usage?.active ? `Internal ${usage.stage} children are running; usage is sampled from their Pi sessions.`
+                : "Agent-owned implementation: activity and output appear in the main Pi conversation.",
+            ...(plan?.work.current ?? []).map((line) => `Current checkpoint: ${line}`),
+            ...(plan?.agents ?? []).map((agent) => `${agent.name}: ${agent.role} · ${agent.status}`),
+          ]),
           manifest
             ? `Branch ${manifest.branch} · ${manifest.status} · next #${manifest.nextIteration}`
             : "No durable autoresearch run for this session.",
           manifest
-            ? `Baseline ${manifest.baselineMetric ?? "n/a"} · best ${manifest.bestMetric ?? "n/a"} · ${manifest.bestCommit.slice(0, 12)}`
-            : "Run /kanban implement to begin an experiment.",
+            ? `Baseline ${manifest.baselineMetric ?? "n/a"} · latest ${latest?.metric ?? "n/a"} · best ${manifest.bestMetric ?? "n/a"} · target ${live?.target ?? config.loop.target ?? "not set"}`
+            : "Checkpoints are recorded with kanban_update; external child output belongs to its scheduler.",
+          ...(values.length ? [`Recent metrics ${trend} · ${live?.direction ?? config.loop.direction} is better · min ${low}, max ${high}`] : []),
           "",
           "#   decision        metric       validation  commit       rationale / reason",
-          ...records.slice(-12).reverse().map((record) => {
+          ...records.slice(Math.max(0, records.length - 6 - offset), records.length - offset).reverse().map((record) => {
             const decision = record.decision === "keep"
               ? `keep (${record.agentDecision ?? "?"})`
               : `revert (${record.agentDecision ?? "?"})`;
@@ -332,16 +493,67 @@ export async function showExperimentDashboard(
             const note = record.failureReason ?? record.changed?.split("\n").at(-1) ?? record.lesson ?? "";
             return `${String(record.iteration).padEnd(3)} ${pad(decision, 15)} ${pad(metric, 12)} ${pad(validation, 11)} ${pad(commit, 11)} ${note}`;
           }),
+          ...(chosen ? wrapped(`Iteration ${chosen.iteration} comment: ${chosen.failureReason ?? chosen.changed ?? chosen.lesson ?? "No comment recorded."}`, width).slice(0, 4) : []),
           "",
-          "Auto-refreshes every 0.75s · Esc closes",
+          live?.active ? "Live output (bounded tail):" : "Latest output (bounded tail; live text lasts for this Pi process):",
+          ...output.slice(Math.max(0, outputLines - 6 - outputOffset), outputLines - outputOffset),
+          "",
+          "↑/↓ attempts · PgUp/PgDn output · r reloads saved results · Esc closes",
+          "Event-driven updates in this Pi process; no idle polling",
+          "Stop the loop: /kanban implement stop",
         ];
-        return panelLines("Kanban autoresearch", rows, width).map((line, index) =>
+        return panelLines("Kanban implement progress", rows.map(displayText), width).map((line, index) =>
           index === 0 ? theme.fg("accent", theme.bold(line)) : line,
         );
       },
       invalidate: () => {},
+      dispose: () => { closed = true; unsubscribe(); },
       handleInput: (input) => {
         if (matchesKey(keys, input, "tui.select.cancel", ["\u001b"])) finish();
+        else if (matchesKey(keys, input, "tui.select.up", ["\u001b[A", "k"])) offset = Math.min(Math.max(0, records.length - 1), offset + 1);
+        else if (matchesKey(keys, input, "tui.select.down", ["\u001b[B", "j"])) offset = Math.max(0, offset - 1);
+        else if (input === "\u001b[5~") outputOffset = Math.min(Math.max(0, outputLines - 6), outputOffset + 6);
+        else if (input === "\u001b[6~") outputOffset = Math.max(0, outputOffset - 6);
+        else if (input.toLowerCase() === "r") void refresh();
+        tui.requestRender();
+      },
+    };
+  });
+}
+
+/** Inspect the composed Markdown plan without switching conversations or mutating it. */
+export async function showComposedPlan(ctx: ExtensionCommandContext, session: Session): Promise<void> {
+  const body = (await readWorkfile(ctx.cwd, workfileBase(session.planPath))).sections.compose;
+  if (!body?.trim()) {
+    ctx.ui.notify(`No composed plan is recorded for “${session.title}” yet.`, "info");
+    return;
+  }
+  if (!ctx.hasUI || ctx.mode === "rpc") {
+    ctx.ui.notify(`## compose\n${body}`, "info");
+    return;
+  }
+  await ctx.ui.custom<void>((tui, theme, keys, done) => {
+    let offset = 0;
+    let total = 0;
+    const page = Math.max(5, Math.min(24, (tui.terminal.rows || 30) - 8));
+    return {
+      render: (width) => {
+        const lines = wrapped(body, width);
+        total = lines.length;
+        offset = Math.min(offset, Math.max(0, total - page));
+        return panelLines(`Plan · ${session.title}`, [
+          ...lines.slice(offset, offset + page), "",
+          `${offset + 1}–${Math.min(total, offset + page)} / ${total} display lines · ↑/↓ scroll · PgUp/PgDn page · Esc closes`,
+        ], width).map((line, index) => index === 0 ? theme.fg("accent", theme.bold(line)) : line);
+      },
+      invalidate: () => {},
+      handleInput: (input) => {
+        if (matchesKey(keys, input, "tui.select.cancel", ["\u001b"])) done(undefined);
+        else if (matchesKey(keys, input, "tui.select.up", ["\u001b[A", "k"])) offset = Math.max(0, offset - 1);
+        else if (matchesKey(keys, input, "tui.select.down", ["\u001b[B", "j"])) offset = Math.min(Math.max(0, total - page), offset + 1);
+        else if (input === "\u001b[5~") offset = Math.max(0, offset - page);
+        else if (input === "\u001b[6~") offset = Math.min(Math.max(0, total - page), offset + page);
+        tui.requestRender();
       },
     };
   });

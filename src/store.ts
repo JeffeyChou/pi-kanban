@@ -392,6 +392,14 @@ export async function initialize(cwd: string): Promise<KanbanState> {
 
 export const load = (cwd: string) => initialize(cwd);
 
+/** On-demand observation: no lock, initialization, migration, or durable write. */
+export async function readSnapshot(cwd: string): Promise<KanbanState> {
+  const raw = await readRaw(cwd);
+  if (raw === undefined) return emptyState();
+  if (!isV4State(raw)) throw new Error("Open /kanban first to migrate this board before querying its status.");
+  return normalizeState(raw);
+}
+
 export async function mutate<T>(
   cwd: string,
   update: (state: KanbanState) => T,

@@ -36,6 +36,11 @@ Kanban never invokes third-party subagent/background-task tools. Installed tools
 | `src/capabilities.ts` | `pi.getActiveTools()` | Detected external-tool names | Invoke or configure external tools |
 | `src/workfile.ts` | `.kanban/work/<base>.md` | One `## <stage>` section at a time (300-line cap) | Write outside the protected locked-commit path |
 | `src/ui.ts` | Selected state plus live Pi context | Ephemeral widget only | Mutate durable state or scan arbitrary repository files |
+| `src/pipelineprogress.ts` | Child lifecycle/activity | Ephemeral status heartbeat and bounded timing samples | Persist activity or invent an ETA without history |
+| `src/liveprogress.ts` | Public child text, measurement output, loop milestones | Bounded process-local display snapshots | Add Session fields, collect reasoning text, or write transcripts to disk |
+| `src/usage.ts` | Child Pi context/model APIs and reported token/cost totals | Ephemeral per-child context and accumulated cost estimates | Sum independent context windows, double-count usage events, or mutate native Pi billing entries |
+| `src/progressevents.ts` | Live/usage/record/selection events | Repository-scoped microtask notifications | Poll, call a model, or write state |
+| `src/status.ts` | Read-only state snapshot, selected plan, live data, saved loop records | Bounded query response | Join/restart/advance a task or initialize/migrate a board |
 | `init.sh` | State, handoff, plans, Git metadata | No repository data | Stage, commit, or rewrite application code |
 
 The one-way data relationship is intentional:
@@ -43,7 +48,7 @@ The one-way data relationship is intentional:
 1. `state.json` answers **what session is active, at which stage, with which agents**.
 2. Its `planPath` locates the progressive detail needed for a work decision.
 3. `handoff.md` adds only context that would otherwise be lost between conversations: decisions, blockers, next steps, and verification information.
-4. The widget combines state with Pi's live context and idleness signals, but never becomes a source of truth. Its context row belongs to the current Pi conversation, never to a Kanban session.
+4. The widget combines state with Pi's live context and idleness signals, but never becomes a source of truth. Its context row identifies the current executor: internal-stage child context while a run is live, otherwise the main Pi conversation. Parallel child windows remain separate.
 
 ## Durability and mutation protocol
 

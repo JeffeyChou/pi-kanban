@@ -24,6 +24,7 @@ import {
 import { detectExternalTools, isSingleShot } from "./capabilities.js";
 import { loadConfig, type KanbanConfig } from "./config.js";
 import { startImplementLoop, type LoopStart } from "./implementloop.js";
+import { queryStatus } from "./status.js";
 import { deleteLoopArtifacts, readLoopRun, sweepLoopWorktrees } from "./looplog.js";
 import {
   abortPipelineFor,
@@ -60,7 +61,7 @@ import {
   type SessionState,
   type Stage,
 } from "./store.js";
-import { refreshWidget, showDashboard, showExperimentDashboard } from "./ui.js";
+import { refreshWidget, showDashboard, showExperimentDashboard, showComposedPlan } from "./ui.js";
 import {
   deleteWorkfile,
   readWorkfile,
@@ -912,13 +913,28 @@ export default function kanban(pi: ExtensionAPI): void {
           return;
         }
 
-        if (verb === "experiments") {
+        if (verb === "status") {
+          if (body && !["summary", "output", "results", "plan"].includes(body)) {
+            ctx.ui.notify("Usage: /kanban status [summary|output|results|plan]", "error");
+            return;
+          }
+          ctx.ui.notify(await queryStatus(ctx.cwd, { view: (body || "summary") as "summary" | "output" | "results" | "plan" }), "info");
+          return;
+        }
+
+        if (verb === "plan") {
+          if (body) { ctx.ui.notify("Usage: /kanban plan", "error"); return; }
+          await showComposedPlan(ctx, requireSelectedSession(await load(ctx.cwd)));
+          return;
+        }
+
+        if (verb === "experiments" || verb === "progress") {
           if (body) {
-            ctx.ui.notify("Usage: /kanban experiments", "error");
+            ctx.ui.notify(`Usage: /kanban ${verb}`, "error");
             return;
           }
           const session = requireSelectedSession(await load(ctx.cwd));
-          await showExperimentDashboard(ctx, workfileBase(session.planPath));
+          await showExperimentDashboard(ctx, workfileBase(session.planPath), session);
           return;
         }
 
@@ -981,7 +997,7 @@ export default function kanban(pi: ExtensionAPI): void {
         }
 
         ctx.ui.notify(
-          "Unknown Kanban command. Use /kanban, /kanban create, /kanban open, /kanban implement, /kanban experiments, /kanban config, /kanban complete, /kanban pause, /kanban unpause, or /kanban remove.",
+          "Unknown Kanban command. Use /kanban, /kanban create, /kanban open, /kanban implement, /kanban status, /kanban plan, /kanban progress, /kanban experiments, /kanban config, /kanban complete, /kanban pause, /kanban unpause, or /kanban remove.",
           "error",
         );
       } catch (error: unknown) {
@@ -1180,6 +1196,21 @@ export default function kanban(pi: ExtensionAPI): void {
       token,
     );
   }
+
+  pi.registerTool({
+    name: "kanban_status",
+    label: "Kanban Status",
+    description: "Read the selected Kanban task's current status, output, experiment results, or plan without interrupting background work. Use when the user asks; never poll or wait for the task to finish.",
+    promptSnippet: "Answer questions about background Kanban work with a read-only snapshot.",
+    promptGuidelines: ["When asked for progress or results, query once and answer, leaving the background task running. Do not monitor repeatedly or resume implementation in the main conversation merely to check status."],
+    parameters: Type.Object({
+      view: Type.Optional(StringEnum(["summary", "output", "results", "plan"] as const)),
+      iteration: Type.Optional(Type.Integer({ minimum: 1, description: "A completed experiment iteration to inspect; omit for the latest results." })),
+    }),
+    async execute(_id, input, _signal, _update, ctx) {
+      return toolResult(await queryStatus(ctx.cwd, input));
+    },
+  });
 
   pi.registerTool({
     name: TOOL,

@@ -21,6 +21,8 @@ import {
   type LoopRunManifest,
 } from "./looplog.js";
 import { measure, type MeasureOutcome } from "./measure.js";
+import { beginLoopProgress, updateLoopProgress } from "./liveprogress.js";
+import { startLoopWidget } from "./ui.js";
 import {
   armImplementLoop,
   loopChildFailed,
@@ -403,6 +405,7 @@ async function runIteration(
   if (!opened.ok) return discarded(opened.error, `Could not set up the experiment: ${opened.error}.`);
   const worktree = opened.path;
   try {
+    updateLoopProgress(setup.handle.signal, { iteration: input.iteration, best: input.bestMetric });
     setup.handle.status(
       `kanban implement: iteration ${input.iteration}/${setup.loop.maxIterations} — child session`,
     );
@@ -450,6 +453,7 @@ async function runIteration(
     }
 
     const parsed = parseImplementLoopOutput(outcome.result.text);
+    await setup.handle.agents("implement", []);
     // The candidate is captured BEFORE measuring, so measurement debris (build output, caches)
     // can never enter the patch.
     let candidate: string;
@@ -462,6 +466,7 @@ async function runIteration(
         `Iteration ${input.iteration} could not be captured (${detail}); its work was dropped.`,
       );
     }
+    setup.handle.status(`kanban implement: iteration ${input.iteration}/${setup.loop.maxIterations} — measuring candidate`);
     const measured = await setup.measure(worktree, setup.loop, setup.handle.signal, {
       KANBAN_ITERATION: String(input.iteration),
       KANBAN_MAX_ITERATIONS: String(setup.loop.maxIterations),
@@ -699,6 +704,11 @@ async function driveLoop(setup: LoopSetup): Promise<LoopResult> {
       streak += 1;
     }
     await checkpoint("running", iteration + 1);
+    updateLoopProgress(setup.handle.signal, {
+      latest: outcome.metric, best: bestMetric,
+      comment: `${outcome.record.decision}: ${outcome.record.failureReason ?? outcome.record.changed?.split("\n").at(-1) ?? outcome.record.lesson ?? "no rationale provided"}`,
+      activity: success ? "target met; preparing landing" : "iteration recorded",
+    });
 
     if (outcome.stop) {
       stopped = {
@@ -913,137 +923,153 @@ export async function startImplementLoop(
   if (!armed.ok) return refuse(ctx, armed.message, armed.kind);
   const handle = armed.handle;
 
-  const [plan, workfile] = await Promise.all([
-    readPlan(ctx.cwd, session.planPath),
-    readWorkfile(ctx.cwd, base).catch(() => ({ sections: {} }) as Workfile),
-  ]);
-  const measureFn = deps.measure ?? measure;
-
-  let baseline: MeasureOutcome;
-  let manifest: LoopRunManifest;
-  if (existing) {
-    baseline = {
-      validationPass: true,
-      tail: "",
-      ...(existing.baselineMetric === undefined ? {} : { metric: existing.baselineMetric }),
-      metricUnmeasured: false,
-    };
-    manifest = { ...existing, status: "running", updatedAt: new Date().toISOString() };
-  } else if (loop.baselineMetric !== undefined) {
-    // A configured baseline is already-recorded evidence. Re-deriving it would spend another
-    // full measurement — for an expensive fitness command, hours of wall-clock or a scheduler
-    // allocation — to learn a number the operator already supplied.
-    handle.status(`kanban implement: baseline ${loop.baselineMetric} taken from config`);
-    baseline = {
-      validationPass: true,
-      tail: "",
-      metric: loop.baselineMetric,
-      metricUnmeasured: false,
-    };
-    const now = new Date().toISOString();
-    manifest = {
-      schemaVersion: 1,
-      base,
-      branch,
-      baseCommit,
-      bestCommit: baseCommit,
-      ...(auditRef === undefined ? {} : { auditRef }),
-      baselineMetric: loop.baselineMetric,
-      bestMetric: loop.baselineMetric,
-      nextIteration: 1,
-      status: "running",
-      startedAt: now,
-      updatedAt: now,
-    };
-    await writeLoopRun(ctx.cwd, base, manifest);
-  } else {
-    // Baseline: a throwaway worktree with the full iteration lifecycle, so the baseline is
-    // measured exactly as an iteration is and never contaminates the user's tree.
-    handle.status("kanban implement: measuring the baseline");
-    const baselinePath = iterationWorktreePath(ctx.cwd, base, BASELINE_ITERATION);
-    const created = await createDetachedWorktree(ctx.cwd, baseCommit, baselinePath);
-    if (!created.ok) {
-      await disarm(handle);
-      return refuse(
-        ctx,
-        `The Kanban implement loop could not create its baseline worktree: ${created.error ?? "git worktree add failed"}.`,
-        "error",
-      );
-    }
-    await registerWorktree(ctx.cwd, base, {
-      path: baselinePath,
-      pid: process.pid,
-      startedAt: new Date().toISOString(),
+  // Everything after arming, including slow baseline measurement, belongs to the task.
+  // The interactive command returns its handle while promises wait for child/process events.
+  const execute = async (): Promise<LoopResult> => {
+    const abortedBeforeIteration = (): LoopResult => ({ kind: "aborted", iterations: 0, landed: false, advanced: false, message: "the implement loop was stopped during preparation" });
+    const [plan, workfile] = await Promise.all([
+      readPlan(ctx.cwd, session.planPath),
+      readWorkfile(ctx.cwd, base).catch(() => ({ sections: {} }) as Workfile),
+    ]);
+    const measureFn = deps.measure ?? measure;
+    if (handle.signal.aborted) return abortedBeforeIteration();
+    beginLoopProgress(ctx.cwd, base, handle.signal, {
+      title, goal: plan?.prompt?.trim() || title, maxIterations: loop.maxIterations,
+      direction: loop.direction, target: loop.target, metricName: loop.metric_name,
     });
-    try {
-      baseline = await measureFn(baselinePath, loop, handle.signal, {
-        KANBAN_ITERATION: String(BASELINE_ITERATION),
-        KANBAN_MAX_ITERATIONS: String(loop.maxIterations),
-        KANBAN_BASE: base,
-      });
-    } finally {
-      try {
-        await removeWorktreeForce(ctx.cwd, baselinePath);
-      } finally {
-        await unregisterWorktree(ctx.cwd, base, baselinePath).catch(() => undefined);
-      }
-    }
-    const now = new Date().toISOString();
-    manifest = {
-      schemaVersion: 1,
-      base,
-      branch,
-      baseCommit,
-      bestCommit: baseCommit,
-      ...(auditRef === undefined ? {} : { auditRef }),
-      ...(baseline.metric === undefined ? {} : { baselineMetric: baseline.metric, bestMetric: baseline.metric }),
-      nextIteration: 1,
-      status: "running",
-      startedAt: now,
-      updatedAt: now,
-    };
-    await writeLoopRun(ctx.cwd, base, manifest);
-  }
-  if (handle.signal.aborted) {
-    await disarm(handle);
-    return { armed: false, message: "the implement loop was stopped before it started", kind: "info" };
-  }
-  if (loop.metric?.trim() && (baseline.metricUnmeasured || baseline.metric === undefined)) {
-    await disarm(handle);
-    return refuse(
-      ctx,
-      "The Kanban implement loop could not measure the baseline metric, so no iteration could ever be compared against it. Check loop.metric and loop.metric_name.",
-      "error",
-    );
-  }
+    startLoopWidget(ctx, base, handle.signal);
 
-  const setup: LoopSetup = {
-    handle,
-    config: deps.config,
-    loop,
-    base,
-    baseCommit,
-    branch,
-    auditRef,
-    manifest,
-    ...(workfile.sections.compose?.trim() ? { spec: workfile.sections.compose.trim() } : { spec: undefined }),
-    prompt: plan?.prompt?.trim() || title,
-    baseline,
-    measure: measureFn,
+    let baseline: MeasureOutcome;
+    let manifest: LoopRunManifest;
+    if (existing) {
+      baseline = {
+        validationPass: true,
+        tail: "",
+        ...(existing.baselineMetric === undefined ? {} : { metric: existing.baselineMetric }),
+        metricUnmeasured: false,
+      };
+      manifest = { ...existing, status: "running", updatedAt: new Date().toISOString() };
+    } else if (loop.baselineMetric !== undefined) {
+      // A configured baseline is already-recorded evidence. Re-deriving it would spend another
+      // full measurement — for an expensive fitness command, hours of wall-clock or a scheduler
+      // allocation — to learn a number the operator already supplied.
+      handle.status(`kanban implement: baseline ${loop.baselineMetric} taken from config`);
+      baseline = {
+        validationPass: true,
+        tail: "",
+        metric: loop.baselineMetric,
+        metricUnmeasured: false,
+      };
+      const now = new Date().toISOString();
+      manifest = {
+        schemaVersion: 1,
+        base,
+        branch,
+        baseCommit,
+        bestCommit: baseCommit,
+        ...(auditRef === undefined ? {} : { auditRef }),
+        baselineMetric: loop.baselineMetric,
+        bestMetric: loop.baselineMetric,
+        nextIteration: 1,
+        status: "running",
+        startedAt: now,
+        updatedAt: now,
+      };
+      await writeLoopRun(ctx.cwd, base, manifest);
+    } else {
+      // Baseline: a throwaway worktree with the full iteration lifecycle, so the baseline is
+      // measured exactly as an iteration is and never contaminates the user's tree.
+      handle.status("kanban implement: measuring the baseline");
+      const baselinePath = iterationWorktreePath(ctx.cwd, base, BASELINE_ITERATION);
+      const created = await createDetachedWorktree(ctx.cwd, baseCommit, baselinePath);
+      if (!created.ok) {
+        throw new Error(`The Kanban implement loop could not create its baseline worktree: ${created.error ?? "git worktree add failed"}.`);
+      }
+      await registerWorktree(ctx.cwd, base, {
+        path: baselinePath,
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+      });
+      try {
+        baseline = await measureFn(baselinePath, loop, handle.signal, {
+          KANBAN_ITERATION: String(BASELINE_ITERATION),
+          KANBAN_MAX_ITERATIONS: String(loop.maxIterations),
+          KANBAN_BASE: base,
+        });
+      } finally {
+        try {
+          await removeWorktreeForce(ctx.cwd, baselinePath);
+        } finally {
+          await unregisterWorktree(ctx.cwd, base, baselinePath).catch(() => undefined);
+        }
+      }
+      if (handle.signal.aborted) return abortedBeforeIteration();
+      const now = new Date().toISOString();
+      manifest = {
+        schemaVersion: 1,
+        base,
+        branch,
+        baseCommit,
+        bestCommit: baseCommit,
+        ...(auditRef === undefined ? {} : { auditRef }),
+        ...(baseline.metric === undefined ? {} : { baselineMetric: baseline.metric, bestMetric: baseline.metric }),
+        nextIteration: 1,
+        status: "running",
+        startedAt: now,
+        updatedAt: now,
+      };
+      await writeLoopRun(ctx.cwd, base, manifest);
+    }
+    if (handle.signal.aborted) {
+      await disarm(handle);
+      return { kind: "aborted", iterations: 0, landed: false, advanced: false, message: "the implement loop was stopped during preparation" };
+    }
+    if (loop.metric?.trim() && (baseline.metricUnmeasured || baseline.metric === undefined)) {
+      throw new Error("The Kanban implement loop could not measure the baseline metric. Check loop.metric and loop.metric_name.");
+    }
+
+    const setup: LoopSetup = {
+      handle,
+      config: deps.config,
+      loop,
+      base,
+      baseCommit,
+      branch,
+      auditRef,
+      manifest,
+      ...(workfile.sections.compose?.trim() ? { spec: workfile.sections.compose.trim() } : { spec: undefined }),
+      prompt: plan?.prompt?.trim() || title,
+      baseline,
+      measure: measureFn,
+    };
+    updateLoopProgress(handle.signal, { baseline: baseline.metric, best: manifest.bestMetric });
+
+    return driveLoop(setup);
   };
 
-  const run = driveLoop(setup)
-    .catch((error: unknown): LoopResult => {
+  const run = execute()
+    .catch(async (error: unknown): Promise<LoopResult> => {
       const message = error instanceof Error ? error.message : String(error);
+      const saved = await readLoopRun(ctx.cwd, base).catch(() => undefined);
+      const ownsRun = await handle.check("implement").then((checked) => checked.ok, () => false);
+      if (saved && ownsRun)
+        await writeLoopRun(ctx.cwd, base, { ...saved, status: "failure", updatedAt: new Date().toISOString() }).catch(() => undefined);
+      updateLoopProgress(handle.signal, { activity: `failure: ${message}` });
+      await disarm(handle);
       ctx.ui.notify(
         `Kanban implement loop for “${title}” stopped: ${message}`,
         "error",
       );
-      return { kind: "stopped", iterations: 0, landed: false, advanced: false, message };
+      return { kind: handle.signal.aborted ? "aborted" : "failure", iterations: 0, landed: false, advanced: false, message };
+    })
+    .then((result) => {
+      updateLoopProgress(handle.signal, { activity: `${result.kind}: ${result.message ?? (result.landed ? "best result landed" : "nothing landed")}` });
+      return result;
     })
     .finally(() => {
       handle.release();
     });
   handle.track(run.then(() => undefined));
+  ctx.ui.notify(`Kanban implement task started in the background for “${title}”. Ask for progress or use /kanban status; no monitoring turn is needed.`, "info");
   return { armed: true, run };
 }

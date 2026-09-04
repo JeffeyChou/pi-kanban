@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { removeWorktreeForce } from "./worktree.js";
+import { publishProgress } from "./progressevents.js";
 
 export interface LoopIterationRecord {
   iteration: number;
@@ -137,6 +138,7 @@ export async function appendLoopLog(
 ): Promise<void> {
   await mkdir(loopDir(cwd), { recursive: true });
   await appendFile(loopLogPath(cwd, base), `${JSON.stringify(record)}\n`, "utf8");
+  publishProgress(cwd, "records");
 }
 
 /** Every parseable record; unreadable/missing ⇒ []. Unparseable lines are skipped. */
@@ -304,6 +306,7 @@ export async function writeLoopRun(
   manifest: LoopRunManifest,
 ): Promise<void> {
   await atomicWrite(loopRunPath(cwd, base), `${JSON.stringify(manifest)}\n`);
+  publishProgress(cwd, "records");
 }
 
 /** Read a valid recovery point; corruption is deliberately recoverable as `undefined`. */
@@ -433,6 +436,7 @@ export async function deleteLoopArtifacts(cwd: string, base: string): Promise<vo
       .map((entry) => rm(join(directory, entry), { force: true })),
   );
   await rm(worktreeRoot(cwd, base), { recursive: true, force: true });
+  publishProgress(cwd, "records");
 }
 
 function defaultIsAlive(pid: number): boolean {

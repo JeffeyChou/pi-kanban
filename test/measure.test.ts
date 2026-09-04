@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { LoopConfig } from "../src/config.js";
+import { beginLoopProgress, endLoopProgress, loopProgress } from "../src/liveprogress.js";
 import {
   MEASURE_TAIL_MAX_LINES,
   measure,
@@ -47,6 +48,21 @@ test("parseMetric accepts finite lines, filters names, and keeps the last finite
   );
   assert.equal(parseMetric("METRIC other=9\n", "score"), undefined);
   assert.equal(parseMetric("METRIC any=4\n"), 4);
+});
+
+test("measurement output reaches the live panel and failed validation still runs the metric", async () => {
+  const cwd = await sandbox();
+  const controller = new AbortController();
+  beginLoopProgress(cwd, "measure", controller.signal, { title: "measure", goal: "score", maxIterations: 1, direction: "higher" });
+  try {
+    const result = await measure(cwd, loop({ validate: "echo validation-failed; exit 1", metric: "echo METRIC score=4" }), controller.signal);
+    const live = loopProgress(cwd, "measure")!;
+    assert.match(live.output, /validation-failed/);
+    assert.match(live.output, /\[validate\] exit 1/);
+    assert.match(live.output, /METRIC score=4/);
+    assert.equal(result.validationPass, false);
+    assert.equal(result.metric, 4);
+  } finally { endLoopProgress(controller.signal); await rm(cwd, { recursive: true, force: true }); }
 });
 
 test("measure reports validation pass and failure and prefers failing output in its tail", async () => {
