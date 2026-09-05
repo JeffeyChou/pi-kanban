@@ -301,13 +301,15 @@ test("the worktree manifest registers, replaces by path, unregisters and reads b
 });
 
 test("deleteLoopArtifacts removes every artifact for one base, idempotently, leaving others", async () => {
-  const cwd = await sandbox();
+  const { root, repo: cwd, base } = await makeRepo();
   try {
     await appendLoopLog(cwd, "gone", record(1));
     await renderLivingSummary(cwd, "gone", [record(1)]);
     await writeBestPatch(cwd, "gone", "patch text");
     await writeLandedMarker(cwd, "gone", "sha");
-    await registerWorktree(cwd, "gone", { path: "/tmp/wt/gone", pid: 1, startedAt: "t" });
+    const retained = iterationWorktreePath(cwd, "gone", 1);
+    assert.equal((await createDetachedWorktree(cwd, base, retained)).ok, true);
+    await registerWorktree(cwd, "gone", { path: retained, pid: 1, startedAt: "t", retain: true });
     await appendLoopLog(cwd, "stay", record(1));
 
     await deleteLoopArtifacts(cwd, "gone");
@@ -315,6 +317,7 @@ test("deleteLoopArtifacts removes every artifact for one base, idempotently, lea
       await assert.rejects(access(path(cwd, "gone")));
     }
     await assert.rejects(access(worktreeRoot(cwd, "gone")));
+    assert.ok(!(await git(cwd, ["worktree", "list", "--porcelain"])).includes(retained));
 
     // Idempotent, and other bases are untouched.
     await deleteLoopArtifacts(cwd, "gone");
@@ -322,8 +325,29 @@ test("deleteLoopArtifacts removes every artifact for one base, idempotently, lea
     await deleteLoopArtifacts(cwd, "stay");
     assert.deepEqual(await readLoopLog(cwd, "stay"), []);
   } finally {
-    await rm(cwd, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
   }
+});
+
+test("artifact cleanup refuses a manifest path outside the selected session", async () => {
+  const cwd = await sandbox();
+  try {
+    await registerWorktree(cwd, "selected", { path: join(cwd, "user-data"), pid: 1, startedAt: "t", retain: true });
+    await assert.rejects(deleteLoopArtifacts(cwd, "selected"), /outside the selected session/);
+    assert.equal((await readWorktreeManifest(cwd, "selected")).length, 1);
+  } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
+test("parallel child snapshot registration never loses a retained worktree entry", async () => {
+  const cwd = await sandbox();
+  try {
+    await Promise.all(Array.from({ length: 12 }, (_, i) => registerWorktree(cwd, "parallel", {
+      path: iterationWorktreePath(cwd, "parallel", i + 1), pid: process.pid, startedAt: "now", retain: true,
+    })));
+    assert.equal((await readWorktreeManifest(cwd, "parallel")).length, 12);
+    await Promise.all(Array.from({ length: 6 }, (_, i) => unregisterWorktree(cwd, "parallel", iterationWorktreePath(cwd, "parallel", i + 1))));
+    assert.equal((await readWorktreeManifest(cwd, "parallel")).length, 6);
+  } finally { await rm(cwd, { recursive: true, force: true }); }
 });
 
 test("sweepLoopWorktrees removes dead-owner worktrees and leaves live-owner ones untouched", async () => {

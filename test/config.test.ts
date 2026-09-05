@@ -3,11 +3,24 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { loadConfig, resolveConfigModel } from "../src/config.js";
+import { loadConfig, resolveConfigModel, validateLoopRevision } from "../src/config.js";
 
 async function sandbox() {
   return mkdtemp(join(tmpdir(), "kanban-config-test-"));
 }
+
+test("managed job configuration and user revisions validate adapter shape and zero submission budgets", () => {
+  assert.doesNotThrow(() => validateLoopRevision({ maxSubmissions: 0, maxChildRuns: 0, jobs: {
+    cpu: { kind: "local", command: "check" },
+    capture: { kind: "scheduled", submit: "submit", status: "status", cancel: "cancel", collect: "collect", timeoutMs: 10000 },
+  } }));
+  for (const patch of [
+    { maxSubmissions: -1 }, { maxConcurrentChildren: 0 }, { enabled: false }, { target: Infinity },
+    { jobs: { bad: { kind: "scheduled", submit: "submit" } } },
+    { jobs: { bad: { kind: "local", command: "check", shell: "arbitrary" } } },
+    { arbitraryCommand: "run" },
+  ]) assert.throws(() => validateLoopRevision(patch));
+});
 
 test("config layers use defaults, then agent configuration, then repository configuration", async () => {
   const cwd = await sandbox();

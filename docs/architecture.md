@@ -6,7 +6,9 @@ This document is for agents and maintainers who need to change Kanban without re
 
 Pi owns model invocation, context accounting, the active conversation, tool execution, and any external subagent/background-task facilities. Kanban is deliberately narrower: it records the selected repository-local work session, gives the active agent a compact durable workflow, and runs the pipeline stages (refine, research, grill, compose) in its own internal child sessions.
 
-Kanban never invokes third-party subagent/background-task tools. Installed tools (`pi-subagents` / `pi-background-tasks` / `rpiv-ask-user-question`) are only detected by name and named in the implement kickoff. When an external scheduler creates agents, the active agent records their names, roles, and statuses in a material checkpoint.
+Kanban never invokes third-party subagent/background-task tools. Those remain available to
+agent-owned implementation. Enabled loops own persistent coordinator/worker/reviewer sessions
+and configured job adapters. See [reactive iterations](plans/reactive-iterations.md).
 
 | Owned by Pi | Owned by Kanban |
 | --- | --- |
@@ -15,7 +17,7 @@ Kanban never invokes third-party subagent/background-task tools. Installed tools
 | Pi conversation switching and creation | `/kanban open`-initiated implement conversation; pipeline itself never switches conversations |
 | Tool scheduling and external subagent execution | Compact external-agent roster and role/status records |
 | Model/auth resolution for child sessions (L1 limits it to `~/.pi/agent`-registered providers) | Per-stage model config and fallback to the parent model |
-| Git commands when an agent explicitly runs them | Read-only git, worktree scaffolding, and `git apply` without `--index`; never automatic staging or committing |
+| Git commands when an agent explicitly runs them | Private snapshot/accepted/audit commits; unstaged landing and experiment-only completion staging; never a user-checkout commit |
 | Filesystem isolation for child sessions (Kanban has none to give) | Per-iteration `git worktree` experiment isolation for the implement loop |
 
 ## Component contracts
@@ -31,6 +33,10 @@ Kanban never invokes third-party subagent/background-task tools. Installed tools
 | `src/measure.ts` | The opt-in `loop.validate`/`loop.metric` commands | Nothing durable; a `MeasureOutcome` | Throw, run git, write files, leave a process group alive after a timeout, or let a failing `loop.validate` skip `loop.metric` |
 | `src/looplog.ts` | `.kanban/loop/*`, `.kanban/worktrees/*/manifest.json` | Per-base run manifest, iteration log, living summary, best patch, landed marker, worktree manifest | Use a shared global path or sweep a worktree whose owner PID is alive |
 | `src/runner.ts` | Child spec | Pass-through child-session text | Throw; both backends return `ChildResult` errors |
+| `src/coordinator.ts` | Durable events, source, revisions and evidence | Supervisor/child dispatch, exact-source review, locked integration/revision/finish | Treat a child response as acceptance, weaken criteria, or finish with unresolved work |
+| `src/coordinationstore.ts` | Board identity and coordinator snapshot | Locked durable events, lanes/jobs, controls and revisions | Expand Session state or accept stale owner callbacks |
+| `src/iterationsession.ts` | Pi SDK, saved internal conversations | Persistent sessions and public telemetry | Load third-party extensions or recount prior-session usage |
+| `src/jobs.ts` | Frozen adapters and receipts | Local execution, scheduler observation/collection/cancellation | Interpolate model parameters into shell or blindly retry an unknown submission |
 | `src/prompts.ts` | Stage inputs | Prompt/system-prompt text, parsed stage output | Mention `init` in stage prompts |
 | `src/config.ts` | Defaults, global + repository config files | Resolved merged `KanbanConfig` | Require a user-maintained model limit |
 | `src/capabilities.ts` | `pi.getActiveTools()` | Detected external-tool names | Invoke or configure external tools |
@@ -60,7 +66,7 @@ The only ordinary state writes are:
 
 - create, select, rename, pause, unpause, or remove a session (pause/remove/rename also abort any live pipeline run and clear its token);
 - a material `checkpoint` or `stage_complete` call;
-- an orchestrator stage commit or critique-gate mutation;
+- an orchestrator stage commit, critique-gate mutation, or coordinator lane/job/control milestone;
 - one-time v1/v2/v3 migration.
 
 `agent_start`, `agent_end`, and `tool_execution_end` refresh the widget but do not mutate state. This protects both disk churn and agent context from a stream of bookkeeping tool calls.
@@ -80,6 +86,11 @@ The critique gate follows the same shape with its own CAS generation: `stage_com
 Runner backends: the in-process runner (extension-free child session built on `DefaultResourceLoader` + `createAgentSession`) is the default; the subprocess runner (`pi -p` print mode, prompt via stdin, full `--no-*` flag parity) is the escape hatch and the `runner: "subprocess"` config choice. Both honor the resolved per-stage model. Known limitation L1: a child runtime builds auth/models from `~/.pi/agent` files, so providers registered dynamically via `pi.registerProvider` may not authenticate in a child; the runner classifies this as `errorKind: "model"` and the manual-fallback path reports it.
 
 Cross-process pause takes effect at stage boundaries: the orchestrator reloads state between stages, so a `blocked`/missing session only stops the pipeline between children, never mid-child.
+
+Implement coordinator mutations use title/stage/active/token guards; jobs and children run
+outside the lock. Pending revisions block dispatch/acceptance. Successful landing and stage
+advance share that guarded lock. Per-artifact replacement is atomic, not a multi-file transaction
+with Git or the scheduler; see managed-jobs.md for recovery limitations.
 
 ## Session lifecycle
 

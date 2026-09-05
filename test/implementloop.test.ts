@@ -22,6 +22,7 @@ import { readWorkfile, workfileBase, writeWorkfileSection } from "../src/workfil
 import { readLoopLog, readLoopRun } from "../src/looplog.js";
 import { loopProgress } from "../src/liveprogress.js";
 import { queryStatus } from "../src/status.js";
+import { scriptedIteration } from "./scripted-iteration.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -244,6 +245,7 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     start: (overrides) =>
       startImplementLoop(ctx, TITLE, {
         runChild,
+        coordinate: scriptedIteration,
         config: config(overrides),
         ...(options.measure ? { measure: options.measure as never } : {}),
       }) as never,

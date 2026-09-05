@@ -94,17 +94,28 @@ overwrite another's:
 | Path | Contents |
 | --- | --- |
 | `loop/<base>.run.json` | Atomic recovery point: private branch, base/best commit, audit ref and its tip, baseline/best metric, next iteration, and terminal/resumable status. |
+| `loop/<base>.coordinator.json` | Locked versioned goal/revisions, pending controls, lanes, frozen job receipts, budgets, explicit finish and durable inbox. |
+| `loop/<base>.sessions/<iteration>/` | Persistent coordinator and worker/reviewer Pi conversations; prior-iteration snapshot on moving to a new iteration. Never main-chat paths. |
 | `loop/<base>.jsonl` | One JSON record per iteration: agent decision, host decision, private commit when kept, audit commit when `loop.audit` is on, changed summary, validation, metric, failure reason, lesson, verdict. |
 | `loop/<base>.md` | The bounded living summary injected into the next iteration's prompt. |
 | `loop/<base>.patch` | The best-so-far patch, always written before landing so a failed `git apply` is recoverable by hand. |
 | `loop/<base>.landed` | Atomic `{ base, patchSha }` marker written after a successful apply and BEFORE the advancing mutate, so a re-run never applies the same patch twice. |
-| `worktrees/<base>/<n>` | The disposable iteration worktree (detached, no branch), force-removed after the iteration. |
-| `worktrees/<base>/manifest.json` | Active worktree paths with their owner PID and start time. Startup removes only dead-owner worktrees. |
+| `worktrees/<base>/<n>` | Detached integration worktree; retained while unfinished, removed after iteration acceptance. |
+| `worktrees/<base>/<n>-<lane/job>-<suffix>` | Private worker/reviewer/job snapshots retained for partial-source recovery and evidence inspection. |
+| `worktrees/<base>/manifest.json` | Worktree path, PID, start time, optional `retain`. Startup removes only dead-owner, non-retained entries. |
 
 The loop adds NO `state.json` field: its run identity is the existing `mode: "pipeline"` plus
 `pipelineToken`. Its artifacts are durable experiment history: they are kept after success,
 pause, exhaustion, and failure so a new agent can rehydrate from the run manifest plus JSONL;
 `/kanban remove` is the explicit cleanup path.
+
+Events are persisted before delivery; handled history is bounded to 128 events, never pending
+delivery. Review/jobs bind exact source and acceptance revision. Job IDs/config/source/deadlines
+stay frozen through goal changes; a pending revision blocks dispatch/finish and updates plan/spec
+under the board lock. No lane/job graph enters compact plans or the handoff. Stop/remove cannot
+discard uncertain scheduler ownership. Retained evidence can consume substantial disk;
+completed-session cleanup is deliberate operator work. There is no daemon or cross-process
+control-event transport.
 
 Two Git refs outlive all of it, because a swept worktree must not take the record with it:
 `kanban-autoresearch/<base>` (accepted candidates only) and, with `loop.audit`,

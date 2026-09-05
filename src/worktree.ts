@@ -122,6 +122,49 @@ export async function createDetachedWorktree(
   return { ok: run.ok, error: run.ok ? undefined : run.error };
 }
 
+/** Make an immutable source identity in a private detached worktree, without publishing it. */
+export async function commitWorktreeSnapshot(cwd: string): Promise<string> {
+  if (!cwd.includes("/.kanban/worktrees/")) throw new Error("Snapshots require a private Kanban worktree");
+  if ((await runGit(cwd, ["symbolic-ref", "--quiet", "HEAD"])).ok)
+    throw new Error("Snapshots require detached HEAD");
+  const parent = await headCommit(cwd);
+  const added = await runGit(cwd, ["add", "-A"]);
+  if (!added.ok || !parent) throw new Error(added.error ?? "Snapshot parent is missing");
+  const tree = await runGit(cwd, ["write-tree"]);
+  if (!tree.ok) throw new Error(tree.error);
+  const commit = await runGitStdin(cwd, ["commit-tree", tree.stdout.trim(), "-p", parent], "Kanban private source snapshot\n");
+  if (!commit.ok) throw new Error(commit.error);
+  const moved = await runGit(cwd, ["update-ref", "HEAD", commit.stdout.trim(), parent]);
+  if (!moved.ok) throw new Error(moved.error);
+  return commit.stdout.trim();
+}
+
+/** Copy source changes into a separate snapshot BEFORE any validation command can mutate it. */
+export async function snapshotWorktree(main: string, source: string, destination: string): Promise<string> {
+  const head = await headCommit(source);
+  if (!head) throw new Error("Source worktree has no HEAD");
+  const patch = await capturePatch(source, head);
+  const opened = await createDetachedWorktree(main, head, destination);
+  if (!opened.ok) throw new Error(opened.error);
+  try {
+    if (patch.trim()) {
+      const applied = await landPatch(destination, patch);
+      if (!applied.ok) throw new Error(applied.error);
+    }
+    return await commitWorktreeSnapshot(destination);
+  } catch (error) {
+    await removeWorktreeForce(main, destination);
+    throw error;
+  }
+}
+
+export async function changedWorktreePaths(cwd: string): Promise<string[]> {
+  const tracked = await runGit(cwd, ["diff", "--name-only", "-z", "HEAD"]);
+  const added = await runGit(cwd, ["ls-files", "--others", "--exclude-standard", "-z"]);
+  if (!tracked.ok || !added.ok) throw new Error(tracked.error ?? added.error);
+  return [...new Set((tracked.stdout + added.stdout).split("\0").filter(Boolean))];
+}
+
 /** Ensure the durable private experiment branch exists at `base`. */
 export async function ensureExperimentBranch(
   cwd: string,

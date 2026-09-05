@@ -22,7 +22,9 @@ import {
   type WorkSummary,
 } from "./artifacts.js";
 import { detectExternalTools, isSingleShot } from "./capabilities.js";
-import { loadConfig, type KanbanConfig } from "./config.js";
+import { loadConfig, LoopRevisionSchema, validateLoopRevision, type KanbanConfig } from "./config.js";
+import { cancelCoordinatorJobs } from "./coordinator.js";
+import { readCoordination, recordControl, requestControl, wakeCoordinator, writeCoordination, type ControlRequest } from "./coordinationstore.js";
 import { startImplementLoop, type LoopStart } from "./implementloop.js";
 import { queryStatus } from "./status.js";
 import { deleteLoopArtifacts, readLoopRun, sweepLoopWorktrees } from "./looplog.js";
@@ -30,6 +32,9 @@ import {
   abortPipelineFor,
   clearPipelineRegistry,
   hasLiveRun,
+  pipelineRunFor,
+  rebindImplementContext,
+  shutdownKanbanRuns,
   runCritiqueGate,
   startPipeline,
   type OrchestratorDeps,
@@ -53,6 +58,7 @@ import {
   renameSession,
   replaceAgents,
   requireSelectedSession,
+  selectedSession,
   setSelectedSession,
   setSessionState,
   type AgentRecord,
@@ -364,8 +370,16 @@ async function implementCommand(
   const state = await load(ctx.cwd);
   const session = requireSelectedSession(state);
   if (stop) {
+    const base = workfileBase(session.planPath);
+    if (!(await cancelCoordinatorJobs(ctx.cwd, base))) {
+      ctx.ui.notify("Cancellation remains unresolved. Resume the saved coordinator to reconcile job identities before stopping or removing this session.", "warning");
+      return;
+    }
+    const pending = pipelineRunFor(session.title);
+    const stopped = abortPipelineFor(session.title);
+    await pending;
     ctx.ui.notify(
-      abortPipelineFor(session.title)
+      stopped
         ? `Stopped the live Kanban run for “${session.title}”. Nothing was landed.`
         : `No Kanban run is live for “${session.title}”.`,
       "info",
@@ -477,6 +491,14 @@ async function openSession(
     ctx.ui.notify(`Kanban session “${candidate.title}” is paused. Use /kanban unpause first.`, "info");
     return;
   }
+  if (candidate.stage === "implement" && hasLiveRun(candidate.title)) {
+    await selectTitle(ctx.cwd, candidate.title);
+    await startCleanConversation(ctx, candidate, {
+      kickoff: "This conversation controls the already-running Kanban iteration. Use kanban_status for a snapshot and kanban_control for user-requested steering, retries, answers, or goal changes. Keep execution in its background coordinator.",
+      afterSwitch: async (fresh) => { rebindImplementContext(fresh); await refreshWidget(fresh, await load(fresh.cwd)); },
+    });
+    return;
+  }
   // Any live run for this title (pipeline or critique gate) is aborted before reopening.
   abortPipelineFor(candidate.title);
   const selected = await selectTitle(ctx.cwd, candidate.title);
@@ -498,7 +520,7 @@ async function openSession(
     if (
       config.loop.enabled &&
       config.loop.autoResume &&
-      savedRun?.status === "paused"
+      (savedRun?.status === "paused" || savedRun?.status === "running")
     ) {
       ctx.ui.notify(
         `Resuming the paused autoresearch run for “${session.title}” at iteration ${savedRun.nextIteration}.`,
@@ -568,7 +590,13 @@ async function removeSessionPermanently(
     `Remove “${candidate.title}” from the board and permanently delete its plan file? This cannot be undone.`,
   );
   if (!confirmed) return;
+  if (!(await cancelCoordinatorJobs(ctx.cwd, workfileBase(candidate.planPath)))) {
+    ctx.ui.notify("Cannot remove this session while scheduler jobs have unresolved ownership or cancellation. Resume it to reconcile them first.", "warning");
+    return;
+  }
+  const pending = pipelineRunFor(candidate.title);
   abortPipelineFor(candidate.title);
+  await pending;
   const removed = await mutate(ctx.cwd, (state) => {
     const current = state.sessions.find((session) => session.title === candidate.title);
     if (!current) throw new Error("Kanban session changed before it could be removed");
@@ -747,6 +775,7 @@ export default function kanban(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     const state = await refresh(ctx);
+    rebindImplementContext(ctx);
     try {
       await sweepOrphanWorkfiles(
         ctx.cwd,
@@ -763,8 +792,9 @@ export default function kanban(pi: ExtensionAPI): void {
       // Recovery is best-effort cleanup; never block startup on it.
     }
   });
-  pi.on("session_shutdown", async () => {
-    clearPipelineRegistry();
+  pi.on("session_shutdown", async (event) => {
+    if (["new", "resume", "fork"].includes(event.reason)) clearPipelineRegistry(true);
+    else await shutdownKanbanRuns();
   });
   pi.on("model_select", async (_event, ctx) => {
     await refresh(ctx);
@@ -848,6 +878,18 @@ export default function kanban(pi: ExtensionAPI): void {
     await writeFile(path, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
     warnedConfigDirs.delete(ctx.cwd);
     const reloaded = await loadConfig(ctx.cwd);
+    const selected = selectedSession(await load(ctx.cwd));
+    if (!reloaded.warnings.length && selected?.stage === "implement" && selected.state === "active" &&
+      JSON.stringify(loaded.config.loop) !== JSON.stringify(reloaded.config.loop) &&
+      await readCoordination(ctx.cwd, workfileBase(selected.planPath))) {
+      if (!reloaded.config.loop.enabled) {
+        ctx.ui.notify("Loop disabled for future starts. Use /kanban implement stop to explicitly cancel current jobs; the live campaign has not been cancelled.", "warning");
+      } else {
+        await requestControl(ctx.cwd, workfileBase(selected.planPath), selected.title, {
+          action: "revise", message: "Apply the user-edited loop configuration and reconcile the current research plan.", loop: reloaded.config.loop,
+        });
+      }
+    }
     if (reloaded.warnings.length)
       ctx.ui.notify(`Kanban config saved with warnings: ${reloaded.warnings.join("; ")}`, "warning");
     else ctx.ui.notify("Kanban config saved.", "info");
@@ -919,6 +961,14 @@ export default function kanban(pi: ExtensionAPI): void {
             return;
           }
           ctx.ui.notify(await queryStatus(ctx.cwd, { view: (body || "summary") as "summary" | "output" | "results" | "plan" }), "info");
+          return;
+        }
+
+        if (verb === "steer" || verb === "goal") {
+          if (!body) { ctx.ui.notify(`Usage: /kanban ${verb} <message>`, "error"); return; }
+          const session = requireSelectedSession(await load(ctx.cwd));
+          ctx.ui.notify(await requestControl(ctx.cwd, workfileBase(session.planPath), session.title,
+            { action: verb === "goal" ? "revise" : "steer", message: body }), "info");
           return;
         }
 
@@ -1213,6 +1263,26 @@ export default function kanban(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "kanban_control",
+    label: "Kanban Control",
+    description: "Steer the selected implement coordinator, revise its goal and run settings, request a lane retry, or answer a pending child question. Work stays in the coordinator. Progress alone uses kanban_status.",
+    promptSnippet: "Send user-requested changes to the running Kanban coordinator.",
+    promptGuidelines: ["Use revise when the user changes the research goal, acceptance, scope, or job settings. Supply the user's intent; the coordinator prepares and applies the plan revision.", "Use the saved lane name for retry/reply. Never launch competing external agents or hand-edit a live experiment to implement a steering request."],
+    parameters: Type.Object({
+      action: StringEnum(["steer", "revise", "retry", "reply"] as const),
+      message: Type.String({ minLength: 1 }), lane: Type.Optional(Type.String()),
+      loop: Type.Optional(LoopRevisionSchema), inScope: Type.Optional(Type.Array(Type.String())), outOfScope: Type.Optional(Type.Array(Type.String())),
+    }),
+    async execute(_id, input: ControlRequest, _signal, _update, ctx) {
+      if (input.loop) validateLoopRevision(input.loop);
+      if (input.action !== "revise" && (input.loop || input.inScope || input.outOfScope)) throw new Error("Settings and scope changes require action revise");
+      const session = requireSelectedSession(await load(ctx.cwd));
+      const receipt = await requestControl(ctx.cwd, workfileBase(session.planPath), session.title, input);
+      return toolResult(`${receipt}${hasLiveRun(session.title) ? "" : " No coordinator is live in this Pi process; use /kanban implement to resume and apply it."}`);
+    },
+  });
+
+  pi.registerTool({
     name: TOOL,
     label: "Kanban Checkpoint",
     description:
@@ -1250,9 +1320,21 @@ export default function kanban(pi: ExtensionAPI): void {
           if (input.agents) replaceAgents(session, input.agents);
           session.updatedAt = new Date().toISOString();
           await writeCheckpointArtifacts(ctx.cwd, session, input);
+          if ((input.inScope || input.outOfScope) && session.stage === "implement") {
+            const base = workfileBase(session.planPath);
+            const coordinator = await readCoordination(ctx.cwd, base);
+            if (coordinator) {
+              recordControl(coordinator, {
+                action: "revise", message: "Reconcile this material scope checkpoint with the running implementation plan.",
+                inScope: input.inScope, outOfScope: input.outOfScope,
+              });
+              await writeCoordination(ctx.cwd, base, coordinator);
+            }
+          }
           return session;
         });
         await refreshWidget(ctx, updated.state);
+        wakeCoordinator(ctx.cwd, workfileBase(updated.value.planPath));
         return toolResult(`Checkpoint recorded for ${updated.value.title}.`, {
           title: updated.value.title,
           stage: updated.value.stage,

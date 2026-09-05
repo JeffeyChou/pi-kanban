@@ -5,6 +5,7 @@ import { hasLiveRun } from "./orchestrator.js";
 import { readSnapshot, selectedSession } from "./store.js";
 import { getUsage, usageLines } from "./usage.js";
 import { readWorkfile, workfileBase } from "./workfile.js";
+import { coordinationLines, readCoordination } from "./coordinationstore.js";
 
 export interface StatusQuery {
   view?: "summary" | "output" | "results" | "plan";
@@ -17,8 +18,8 @@ export async function queryStatus(cwd: string, query: StatusQuery = {}): Promise
   if (!session) return "No selected Kanban session.";
   const base = workfileBase(session.planPath);
   const live = loopProgress(cwd, base);
-  const [plan, manifest, records] = await Promise.all([
-    readPlan(cwd, session.planPath), readLoopRun(cwd, base), readLoopLog(cwd, base),
+  const [plan, manifest, records, coordinator] = await Promise.all([
+    readPlan(cwd, session.planPath), readLoopRun(cwd, base), readLoopLog(cwd, base), readCoordination(cwd, base),
   ]);
   const header = [
     `${session.title} · ${session.stage} · ${session.state}`,
@@ -46,15 +47,19 @@ export async function queryStatus(cwd: string, query: StatusQuery = {}): Promise
       `Comment: ${record.failureReason ?? record.changed ?? record.lesson ?? "none recorded"}`,
       ...(record.commit ? [`Accepted commit: ${record.commit}`] : []),
       ...(record.auditCommit ? [`Audit commit: ${record.auditCommit}`] : []),
-    ].join("\n")), ...(selected.length ? [] : ["No completed iterations yet."])].join("\n\n")).slice(0, 12000);
+    ].join("\n")), ...(selected.length ? [] : ["No completed iterations yet."]),
+      ...(coordinator && query.iteration === undefined ? Object.values(coordinator.jobs).slice(-12).map((job) =>
+        `${job.name}: ${job.state}; evidence ${job.accepted ? "accepted" : "not accepted"}; submitted revision ${job.revision}${job.acceptanceRevision ? `; accepted revision ${job.acceptanceRevision}` : ""}\n${(job.artifacts ?? []).join("\n")}${job.error ? `\n${job.error}` : ""}`) : []),
+    ].join("\n\n")).slice(0, 12000);
   }
   const usage = getUsage(cwd, session.title);
   return displayText([...header,
     ...(live ? [`Activity: ${live.activity} (reported ${Math.max(0, Math.floor((Date.now() - live.updatedAt) / 1000))}s ago)`,
-      `Iteration ${live.iteration}/${live.maxIterations} (attempt budget); ${live.childRunning ? 1 : 0} child running`,
+      `Iteration ${live.iteration}/${live.maxIterations} (attempt budget); ${live.childCount ?? (live.childRunning ? 1 : 0)} children running; ${live.jobCount ?? 0} jobs outstanding`,
       `Metric: baseline ${live.baseline ?? "—"}, latest ${live.latest ?? "—"}, best ${live.best ?? "—"}, target ${live.target ?? "not set"}`,
       ...(live.comment ? [`Latest decision: ${live.comment}`] : []),
     ] : (plan?.work.current ?? []).map((line) => `Checkpoint: ${line}`)),
+    ...(coordinator ? coordinationLines(coordinator) : []),
     ...(manifest ? [`Saved result: ${records.length} attempts; best ${manifest.bestMetric ?? "—"}; branch ${manifest.branch}; commit ${manifest.bestCommit}`] : []),
     ...(usage ? usageLines(usage) : []),
     "Query output or results only when needed. Do not poll or keep a monitoring turn running.",

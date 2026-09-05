@@ -69,6 +69,26 @@ export interface LoopConfig {
   auditPaths?: string[];
   /** Resume an interrupted durable experiment when the session opens. */
   autoResume: boolean;
+  /** Named, explicitly configured commands available to the iteration coordinator. */
+  jobs?: Record<string, JobAdapterConfig>;
+  maxConcurrentChildren?: number;
+  /** Campaign-wide limits; omitted limits are left to the configured adapter/site policy. */
+  maxSubmissions?: number;
+  maxChildRuns?: number;
+  maxCoordinatorTurns?: number;
+}
+
+export interface JobAdapterConfig {
+  kind: "local" | "scheduled";
+  /** Local command, or scheduler submit operation. No command comes from a child tool call. */
+  command?: string;
+  submit?: string;
+  status?: string;
+  cancel?: string;
+  collect?: string;
+  pollIntervalMs?: number;
+  timeoutMs?: number;
+  operationTimeoutMs?: number;
 }
 
 export interface KanbanConfig {
@@ -153,11 +173,27 @@ const DecisionPolicySchema = Type.Union([
   Type.Literal("agent-with-validation"),
 ]);
 const PositiveIntegerSchema = Type.Integer({ minimum: 1 });
+const BudgetSchema = Type.Integer({ minimum: 0 });
 const DepthSchema = Type.Union([Type.Literal("focused"), Type.Literal("deep")]);
 const DetailSchema = Type.Union([Type.Literal("plan"), Type.Literal("concise"), Type.Literal("detailed")]);
 const ChildTimeoutSchema = Type.Integer({ minimum: 1000, maximum: 3_600_000 });
 const FiniteNumberSchema = Type.Number();
 const PathListSchema = Type.Array(Type.String({ minLength: 1 }), { minItems: 1 });
+export const JobAdapterSchema = Type.Union([
+  Type.Object({
+    kind: Type.Literal("local"), command: Type.String({ minLength: 1 }),
+    timeoutMs: Type.Optional(PositiveIntegerSchema),
+  }, { additionalProperties: false }),
+  Type.Object({
+    kind: Type.Literal("scheduled"),
+    submit: Type.String({ minLength: 1 }), status: Type.String({ minLength: 1 }),
+    cancel: Type.String({ minLength: 1 }), collect: Type.String({ minLength: 1 }),
+    pollIntervalMs: Type.Optional(PositiveIntegerSchema),
+    timeoutMs: Type.Optional(PositiveIntegerSchema),
+    operationTimeoutMs: Type.Optional(PositiveIntegerSchema),
+  }, { additionalProperties: false }),
+]);
+const JobsSchema = Type.Record(Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$" }), JobAdapterSchema, { additionalProperties: false });
 const LoopValueSchemas = {
   enabled: BooleanSchema,
   validate: StringSchema,
@@ -174,6 +210,11 @@ const LoopValueSchemas = {
   audit: BooleanSchema,
   auditPaths: PathListSchema,
   autoResume: BooleanSchema,
+  jobs: JobsSchema,
+  maxConcurrentChildren: PositiveIntegerSchema,
+  maxSubmissions: BudgetSchema,
+  maxChildRuns: BudgetSchema,
+  maxCoordinatorTurns: BudgetSchema,
 } as const;
 const LoopKeys = Object.keys(LoopValueSchemas) as Array<keyof LoopConfig>;
 const LoopSchema = Type.Object(
@@ -193,9 +234,25 @@ const LoopSchema = Type.Object(
     audit: BooleanSchema,
     auditPaths: Type.Optional(PathListSchema),
     autoResume: BooleanSchema,
+    jobs: Type.Optional(JobsSchema),
+    maxConcurrentChildren: Type.Optional(PositiveIntegerSchema),
+    maxSubmissions: Type.Optional(BudgetSchema),
+    maxChildRuns: Type.Optional(BudgetSchema),
+    maxCoordinatorTurns: Type.Optional(BudgetSchema),
   },
   { additionalProperties: false },
 );
+
+/** A main-conversation goal revision may explicitly change these run settings. */
+export const LoopRevisionSchema = { ...Type.Partial(Type.Object(LoopValueSchemas)), additionalProperties: false };
+
+export function validateLoopRevision(value: unknown): asserts value is Partial<LoopConfig> {
+  if (!Value.Check(LoopRevisionSchema, value)) throw new Error("Invalid loop settings in goal revision");
+  const patch = value as Partial<LoopConfig>;
+  for (const number of [patch.target, patch.baselineMetric])
+    if (number !== undefined && !Number.isFinite(number)) throw new Error("Loop metrics must be finite");
+  if (patch.enabled === false) throw new Error("Stop the loop before disabling it");
+}
 
 const RawConfigSchema = Type.Object(
   {

@@ -16,6 +16,11 @@ export interface LiveLoopProgress {
   comment?: string;
   activity: string;
   childRunning: boolean;
+  childCount?: number;
+  jobCount?: number;
+  revision?: number;
+  pendingRevision?: boolean;
+  lanes?: string[];
   output: string;
   startedAt: number;
   updatedAt: number;
@@ -54,6 +59,13 @@ export function loopProgress(cwd: string, base: string): LiveLoopProgress | unde
   return bySession.get(key(cwd, base));
 }
 
+/** Share display data without sharing cancellation ownership with a local command. */
+export function linkLoopProgress(owner: AbortSignal, child: AbortSignal): () => void {
+  const progress = bySignal.get(owner);
+  if (progress) bySignal.set(child, progress);
+  return () => { bySignal.delete(child); };
+}
+
 export function updateLoopProgress(signal: AbortSignal, update: Partial<LiveLoopProgress>): void {
   const progress = bySignal.get(signal);
   if (!progress?.active || signal.aborted) return;
@@ -74,6 +86,7 @@ export function endLoopProgress(signal: AbortSignal, activity?: string): void {
   if (!progress) return;
   progress.active = false;
   progress.childRunning = false;
+  progress.childCount = 0;
   if (activity) progress.activity = activity;
   progress.updatedAt = Date.now();
   bySignal.delete(signal);

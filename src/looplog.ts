@@ -5,9 +5,10 @@
 
 import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { removeWorktreeForce } from "./worktree.js";
 import { publishProgress } from "./progressevents.js";
+import { mutateAsync } from "./store.js";
 
 export interface LoopIterationRecord {
   iteration: number;
@@ -35,6 +36,8 @@ export interface LoopIterationRecord {
   /** The child's `Status:` verdict for this iteration. */
   verdict?: "complete" | "continue";
   at: string;
+  revision?: number;
+  evidenceOnly?: boolean;
 }
 
 /** Durable identity and recovery point for one autoresearch run. */
@@ -63,6 +66,8 @@ export interface WorktreeEntry {
   /** Owner PID: a sweep removes a worktree only when this process is NOT alive. */
   pid: number;
   startedAt: string;
+  /** Retained until coordinator/job reconciliation releases this worktree, even after Pi exits. */
+  retain?: boolean;
 }
 
 export interface LandedMarker {
@@ -401,10 +406,12 @@ export async function registerWorktree(
   base: string,
   entry: WorktreeEntry,
 ): Promise<void> {
-  const entries = await readWorktreeManifest(cwd, base);
-  const kept = entries.filter((existing) => existing.path !== entry.path);
-  kept.push(entry);
-  await writeManifest(cwd, base, kept);
+  await mutateAsync(cwd, async () => {
+    const entries = await readWorktreeManifest(cwd, base);
+    const kept = entries.filter((existing) => existing.path !== entry.path);
+    kept.push(entry);
+    await writeManifest(cwd, base, kept);
+  });
 }
 
 /** Remove the entry for `path`, if present. Missing manifests are a no-op. */
@@ -413,14 +420,22 @@ export async function unregisterWorktree(
   base: string,
   path: string,
 ): Promise<void> {
-  const entries = await readWorktreeManifest(cwd, base);
-  const kept = entries.filter((existing) => existing.path !== path);
-  if (kept.length === entries.length) return;
-  await writeManifest(cwd, base, kept);
+  await mutateAsync(cwd, async () => {
+    const entries = await readWorktreeManifest(cwd, base);
+    const kept = entries.filter((existing) => existing.path !== path);
+    if (kept.length === entries.length) return;
+    await writeManifest(cwd, base, kept);
+  });
 }
 
 /** Delete every `.kanban/loop/<base>.*` artifact and the base's worktree manifest tree. */
 export async function deleteLoopArtifacts(cwd: string, base: string): Promise<void> {
+  const root = resolve(worktreeRoot(cwd, base));
+  for (const entry of await readWorktreeManifest(cwd, base)) {
+    if (!resolve(entry.path).startsWith(`${root}${sep}`)) throw new Error("Refusing cleanup outside the selected session's worktree directory");
+    const removed = await removeWorktreeForce(cwd, entry.path);
+    if (!removed.ok) throw new Error(removed.error ?? "Could not remove a retained worktree");
+  }
   const directory = loopDir(cwd);
   let entries: string[];
   try {
@@ -433,7 +448,7 @@ export async function deleteLoopArtifacts(cwd: string, base: string): Promise<vo
   await Promise.all(
     entries
       .filter((entry) => entry.startsWith(prefix))
-      .map((entry) => rm(join(directory, entry), { force: true })),
+      .map((entry) => rm(join(directory, entry), { force: true, recursive: true })),
   );
   await rm(worktreeRoot(cwd, base), { recursive: true, force: true });
   publishProgress(cwd, "records");
@@ -469,12 +484,17 @@ export async function sweepLoopWorktrees(
   }
   for (const base of bases) {
     const entries = await readWorktreeManifest(cwd, base);
-    const dead = entries.filter((entry) => !isAlive(entry.pid));
+    const dead = entries.filter((entry) => !entry.retain && !isAlive(entry.pid));
     if (dead.length === 0) continue;
-    for (const entry of dead) {
-      await removeWorktreeForce(cwd, entry.path);
-    }
-    const live = entries.filter((entry) => isAlive(entry.pid));
-    await writeManifest(cwd, base, live);
+    await mutateAsync(cwd, async () => {
+      const current = await readWorktreeManifest(cwd, base);
+      const kept: WorktreeEntry[] = [];
+      for (const entry of current) {
+        if (entry.retain || isAlive(entry.pid)) { kept.push(entry); continue; }
+        const removed = await removeWorktreeForce(cwd, entry.path);
+        if (!removed.ok) kept.push(entry);
+      }
+      await writeManifest(cwd, base, kept);
+    });
   }
 }

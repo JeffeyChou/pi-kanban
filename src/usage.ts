@@ -70,8 +70,8 @@ export function beginChildUsage(
     label, model: `${model.provider}:${model.id}`, contextWindow: model.contextWindow,
     contextStale: false, totalTokens: 0, active: true,
   };
-  // Serial implement iterations need only the current child's context; totals survive.
-  if (stage === "implement") run.children = [];
+  // Keep independent live windows; never replace a coordinator with its newest worker.
+  if (stage === "implement") run.children = run.children.filter((child) => child.active);
   run.children.push(child);
   run.stageChildren++;
   run.totalChildren++;

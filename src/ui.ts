@@ -16,6 +16,7 @@ import { displayText, loopProgress, type LiveLoopProgress } from "./liveprogress
 import { getUsage, usageLines } from "./usage.js";
 import { readWorkfile, workfileBase } from "./workfile.js";
 import { publishProgress, subscribeProgress } from "./progressevents.js";
+import { coordinationLines, readCoordination, type CoordinationState } from "./coordinationstore.js";
 
 interface LiveWidgetState {
   contextWindow: number;
@@ -244,16 +245,18 @@ export function renderLoopProgress(progress: LiveLoopProgress): string[] {
   const metric = progress.metricName ?? "metric";
   return [
     `Goal: ${progress.goal.replace(/\s+/g, " ")}`,
-    `Iteration ${progress.iteration}/${progress.maxIterations} (attempt budget) · ${progress.childRunning ? 1 : 0} child running · ${elapsedText((progress.active ? Date.now() : progress.updatedAt) - progress.startedAt)} elapsed`,
+    `Iteration ${progress.iteration}/${progress.maxIterations} (attempt budget) · ${progress.childCount ?? (progress.childRunning ? 1 : 0)} child running · ${progress.jobCount ?? 0} jobs outstanding · ${elapsedText((progress.active ? Date.now() : progress.updatedAt) - progress.startedAt)} elapsed`,
     `${metric}: baseline ${progress.baseline ?? "—"} · latest ${progress.latest ?? "—"} · best ${progress.best ?? "—"} · target ${progress.target ?? "not set"} · ${progress.direction} is better`,
     `${progress.activity} · activity ${elapsedText(Date.now() - progress.updatedAt)} ago`,
     progress.comment ? `Decision: ${progress.comment}` : "Awaiting the first measured decision",
     `Output: ${progress.output.trim().split("\n").at(-1) || "waiting for child or measurement output"}`,
+    ...(progress.revision === undefined ? [] : [`Goal revision ${progress.revision}${progress.pendingRevision ? " · revision pending" : ""}`]),
+    ...(progress.lanes ?? []).slice(0, 8),
   ].map(displayText);
 }
 
 /** A separate implement panel; the board widget stays four rows. */
-export function startLoopWidget(ctx: ExtensionCommandContext, base: string, signal: AbortSignal): void {
+export function startLoopWidget(ctx: ExtensionContext, base: string, signal: AbortSignal): void {
   if (!ctx.hasUI || signal.aborted) return;
   loopWidgets.get(ctx.cwd)?.();
   let stopped = false;
@@ -416,6 +419,7 @@ export async function showExperimentDashboard(
   await ctx.ui.custom<void>((tui, theme, keys, done) => {
     let manifest: LoopRunManifest | undefined;
     let plan: PlanSnapshot | undefined;
+    let coordinator: CoordinationState | undefined;
     let records: LoopIterationRecord[] = [];
     let closed = false;
     let refreshing = false;
@@ -427,16 +431,18 @@ export async function showExperimentDashboard(
       if (closed) return;
       if (refreshing) { refreshAgain = true; return; }
       refreshing = true;
-      const [nextManifest, nextRecords, nextPlan] = await Promise.all([
+      const [nextManifest, nextRecords, nextPlan, nextCoordinator] = await Promise.all([
         readLoopRun(ctx.cwd, base),
         readLoopLog(ctx.cwd, base),
         session ? readPlan(ctx.cwd, session.planPath) : Promise.resolve(undefined),
-      ]).catch((): [LoopRunManifest | undefined, LoopIterationRecord[], PlanSnapshot | undefined] => [undefined, [], undefined]);
+        readCoordination(ctx.cwd, base),
+      ]).catch((): [LoopRunManifest | undefined, LoopIterationRecord[], PlanSnapshot | undefined, CoordinationState | undefined] => [undefined, [], undefined, undefined]);
       refreshing = false;
       if (closed) return;
       manifest = nextManifest;
       records = nextRecords;
       plan = nextPlan;
+      coordinator = nextCoordinator;
       tui.requestRender();
       if (refreshAgain) { refreshAgain = false; void refresh(); }
     };
@@ -481,6 +487,7 @@ export async function showExperimentDashboard(
             ? `Baseline ${manifest.baselineMetric ?? "n/a"} · latest ${latest?.metric ?? "n/a"} · best ${manifest.bestMetric ?? "n/a"} · target ${live?.target ?? config.loop.target ?? "not set"}`
             : "Checkpoints are recorded with kanban_update; external child output belongs to its scheduler.",
           ...(values.length ? [`Recent metrics ${trend} · ${live?.direction ?? config.loop.direction} is better · min ${low}, max ${high}`] : []),
+          ...(coordinator ? coordinationLines(coordinator).slice(0, 18) : []),
           "",
           "#   decision        metric       validation  commit       rationale / reason",
           ...records.slice(Math.max(0, records.length - 6 - offset), records.length - offset).reverse().map((record) => {

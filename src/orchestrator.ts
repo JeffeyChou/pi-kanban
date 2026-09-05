@@ -28,7 +28,7 @@ import {
   type Session,
   type Stage,
 } from "./store.js";
-import { refreshWidget, startUsageDisplay } from "./ui.js";
+import { refreshWidget, startUsageDisplay, startLoopWidget } from "./ui.js";
 import { beginUsage, beginChildUsage, finishChildUsage, endUsage } from "./usage.js";
 import { readWorkfile, workfileBase, writeWorkfileSection } from "./workfile.js";
 
@@ -59,6 +59,9 @@ interface RunEntry {
   clearStatus?: () => void;
   /** Detached run promise; absent for a critique-gate registration. */
   promise?: Promise<void>;
+  loop?: boolean;
+  cwd?: string;
+  rebind?: (ctx: ExtensionCommandContext) => void;
 }
 
 /** The abort CHANNEL: one live run per title (the CAS identity is Session.pipelineToken). */
@@ -79,19 +82,30 @@ export function abortPipelineFor(title: string): boolean {
   const entry = runs.get(title);
   if (!entry) return false;
   entry.clearStatus?.();
-  runs.delete(title);
+  if (!entry.loop) runs.delete(title);
   entry.controller.abort();
   return true;
 }
 
 /** W4 calls on session_shutdown/reload; orphaned children stop at their next token revalidation. */
-export function clearPipelineRegistry(): void {
-  const entries = [...runs.values()];
-  runs.clear();
+export function clearPipelineRegistry(preserveLoops = false): void {
+  const entries = [...runs.values()].filter((entry) => !preserveLoops || !entry.loop);
+  for (const [title, entry] of runs) if (entries.includes(entry)) runs.delete(title);
   for (const entry of entries) {
     entry.clearStatus?.();
     entry.controller.abort();
   }
+}
+
+export function rebindImplementContext(ctx: ExtensionContext): void {
+  for (const entry of runs.values()) if (entry.loop && entry.cwd === ctx.cwd && !entry.controller.signal.aborted)
+    entry.rebind?.(ctx as ExtensionCommandContext);
+}
+
+export async function shutdownKanbanRuns(): Promise<void> {
+  const pending = [...runs.values()].map((entry) => entry.promise);
+  clearPipelineRegistry();
+  await Promise.allSettled(pending);
 }
 
 /** ABA guard: only the run that owns the entry may unregister it. */
@@ -385,8 +399,10 @@ async function commitStage(
   stage: Stage,
   body: string,
   patch?: (plan: PlanSnapshot) => PlanSnapshot,
+  guard?: () => Promise<void>,
 ): Promise<Guarded<Session>> {
   const committed = await guardedMutate(run, stage, async (state, session) => {
+    await guard?.();
     await writeWorkfileSection(run.ctx.cwd, workfileBase(session.planPath), stage, body);
     advanceStage(state, session);
     replaceAgents(session, withoutChildAgents(session));
@@ -868,6 +884,7 @@ export interface LoopRunHandle {
   readonly title: string;
   readonly token: string;
   readonly signal: AbortSignal;
+  model(): Model<any>;
   /** Read-only revalidation: the pre-land CAS and the per-iteration boundary check. */
   check(
     expected: Stage | undefined,
@@ -882,6 +899,7 @@ export interface LoopRunHandle {
     stage: Stage,
     body: string,
     patch?: (plan: PlanSnapshot) => PlanSnapshot,
+    guard?: () => Promise<void>,
   ): Promise<Guarded<Session>>;
   /** Roster update so the widget shows the running iteration child. */
   agents(stage: Stage, agents: AgentRecord[]): Promise<boolean>;
@@ -931,7 +949,7 @@ export async function armImplementLoop(
   const entry: RunEntry = { controller: new AbortController(), clearStatus: () => ctx.ui.setStatus(STATUS_KEY, undefined) };
   runs.set(title, entry);
   beginUsage(ctx.cwd, title, entry.controller.signal);
-  const stopUsageDisplay = startUsageDisplay(ctx, entry.controller.signal);
+  let stopUsageDisplay = startUsageDisplay(ctx, entry.controller.signal);
   const run: RunContext = {
     ctx,
     title,
@@ -946,16 +964,29 @@ export async function armImplementLoop(
       },
     },
   };
+  entry.loop = true;
+  entry.cwd = ctx.cwd;
+  entry.rebind = (fresh) => {
+    run.ctx = fresh;
+    stopUsageDisplay();
+    stopUsageDisplay = startUsageDisplay(fresh, run.signal);
+    startLoopWidget(fresh, workfileBase(minted.session.planPath), run.signal);
+  };
   return {
     ok: true,
     handle: {
-      ctx,
+      get ctx() { return run.ctx; },
       title,
       token,
       signal: entry.controller.signal,
+      model: () => {
+        const resolved = resolveModel(run.ctx, deps.config, "implement");
+        if (!resolved.ok) throw new Error(resolved.error);
+        return resolved.model;
+      },
       check: async (expected) => revalidate(await load(ctx.cwd), run, expected),
       mutate: (expected, body) => guardedMutate(run, expected, body),
-      commit: (stage, body, patch) => commitStage(run, stage, body, patch),
+      commit: (stage, body, patch, guard) => commitStage(run, stage, body, patch, guard),
       agents: (stage, agents) => announceChildren(run, stage, agents),
       child: async (options) => {
         updateLoopProgress(run.signal, { childRunning: true, activity: options.label, output: "" });
@@ -977,7 +1008,7 @@ export async function armImplementLoop(
         if (line) updateLoopProgress(run.signal, { activity: line });
         status(run, line);
       },
-      notify: (message, kind) => ctx.ui.notify(message, kind),
+      notify: (message, kind) => run.ctx.ui.notify(message, kind),
       track: (promise) => {
         entry.promise = promise;
       },

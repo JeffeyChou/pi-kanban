@@ -15,8 +15,12 @@ Before changing an unfamiliar subsystem, read the matching agent reference: [arc
 | `src/prompts.ts` | Per-stage prompts, the output grammar (`parseStageOutput`), the implement kickoff, and the completion text. |
 | `src/config.ts` | Merged global + repository config with auto-detected init commands. |
 | `src/capabilities.ts` | Active external-tool detection for the implement kickoff. |
-| `src/implementloop.ts` | The opt-in orchestrator-owned implement loop: iteration worktrees, fitness, lessons, termination, landing. Read `docs/plans/loop-driver-v2.md` first. |
-| `src/worktree.ts` | Plain-git worktree/patch primitives. Never `git add`/`git commit`; `git apply` never gets `--index`. |
+| `src/implementloop.ts` | Campaign boundaries, fitness, lessons, audit and landing. Read [reactive iterations](plans/reactive-iterations.md) and the historical loop-driver-v2 landing design. |
+| `src/coordinator.ts` / `src/coordinatorprompts.ts` | Persistent supervisor, worker/reviewer lanes, repair, questions, revisions and acceptance tools. |
+| `src/coordinationstore.ts` | Locked coordinator snapshot, durable inbox, job identities and goal revisions, outside compact v4 state. |
+| `src/iterationsession.ts` | Persistent extension-free Pi sessions and public telemetry, separate from frozen planning/critique `RunChild`. |
+| `src/jobs.ts` | Configured local/scheduled adapters, reserve/reconcile protocol, finite deadlines and confirmed cancellation. |
+| `src/worktree.ts` | Detached source snapshots/private accepted commits, audit and patches; landing never uses `--index`. |
 | `src/measure.ts` | Runs the opt-in `loop.validate`/`loop.metric` commands in their own process group; parses `METRIC <name>=<value>`. |
 | `src/looplog.ts` | `.kanban/loop/<base>.*` breadcrumbs and the owner-PID worktree manifest. |
 | `src/workfile.ts` | The `.kanban/work/<base>.md` section artifact. |
@@ -89,7 +93,18 @@ Stage order is fixed:
 refine → research → grill → compose → implement → critique
 ```
 
-In pipeline mode the orchestrator advances the child-owned stages (refine → compose), one stage per locked commit; `stage_complete` advances the agent-owned stages (implement, critique) and every stage in manual mode. When `config.loop.enabled`, `/kanban implement` makes implement orchestrator-owned too: it is the durable autoresearch loop. Kept candidates are committed only to `kanban-autoresearch/<base>` and a manifest plus JSONL history rehydrates a later fresh child; its final branch diff lands as unstaged working-tree changes and its locked state commit advances implement→critique. Final completion stages only accepted experiment paths and suggests a user commit message; it never commits the user checkout. Transition instructions ride in the tool result — there is no queued kickoff injection.
+In pipeline mode the orchestrator advances refine → compose, one stage per locked commit;
+`stage_complete` advances agent-owned stages. With `config.loop.enabled`, implement is also
+orchestrator-owned: each iteration has a persistent coordinator, private worker/reviewer lanes,
+and managed jobs. Results, failures, questions and controls are persisted before waking that
+coordinator. It repairs affected work while useful siblings continue. This is the enabled-loop
+default; `loop.enabled: false` is unchanged.
+
+Accepted source alone advances `kanban-autoresearch/<base>`. Commands validate separate snapshots;
+accepted commits contain source, not command debris. Evidence-only iterations need no empty
+commit. The branch diff lands unstaged and the locked commit advances implement→critique.
+Final completion stages experiment-owned paths and suggests a commit, never commits the checkout.
+Transition instructions remain in tool results. See [managed jobs](managed-jobs.md).
 
 `session_start` and `model_select` load the durable board and refresh its widget, but never persist or switch Pi conversation paths. `agent_start`, `agent_end`, and `tool_execution_end` refresh the widget from durable state and Pi live data without writing state. Do not reintroduce a per-tool activity log or per-tool mutation: low write frequency and low prompt noise are core requirements.
 
@@ -169,14 +184,27 @@ closing the expanded dashboard removes its subscriptions without aborting the ex
 
 The implement task registers before background preparation and baseline measurement. TUI/RPC
 commands return that handle immediately after preflight; print/json still await its run promise.
-Background failures clean up the handle and report a terminal result. The JavaScript controller
-awaits child/process events; it never runs a model turn or polling loop to monitor work.
+Background failures retain recovery data and report a blocker. The persistent coordinator makes
+decisions on durable events, not model polling. Only configured scheduler status adapters are
+host-polled; unchanged status causes neither durable writes nor model turns.
 `progressevents.ts` coalesces event types within a microtask, scoped by repository. Live/usage events
 redraw cached data; record events reload the open dashboard's durable snapshot. Idle implement
 observers have no intervals or scheduled callbacks. `r` explicitly refreshes cross-process results.
 `kanban_status` and `/kanban status` query once using `store.readSnapshot`, which never acquires a
 lock, creates a board or migrates state. Queries return bounded summaries/output/results/plans
-without touching the run identity, stage or main conversation. Keep external schedulers external.
+without touching run identity, stage or main conversation. Third-party extensions remain external;
+configured managed job adapters belong to the iteration coordinator.
+
+`kanban_control` sends user intent (`steer`, `retry`, `reply`, `revise`). Revisions and scope
+checkpoints queue a pending change under the board lock. Applying it updates plan/spec without
+advancing stage; dispatch/acceptance check revision and token. Only the recorded user request can
+change settings. Older evidence needs explicit revalidation. Partial-source retries preserve the
+original integration baseline.
+
+Pi new/resume/fork rebinds the live coordinator's UI without stopping it. Quit/reload or pause
+suspends local sessions/observers, preserving scheduler jobs and referenced worktrees. Explicit
+stop/remove cancels first and refuses destructive cleanup while ownership is unknown. Internal
+session paths live only in coordinator artifacts, never `state.json` or the main-chat handoff.
 
 `/kanban` opens the shared interactive multi-session dashboard. It must be a non-overlay, bordered editor-area component; do not cover transcript content with an experimental floating overlay. Browse mode previews the highlighted session's status; Enter opens it in a fresh Pi conversation, and Tab enters management mode. Management mode supports Enter to open, `r` to rename, and `x` to permanently delete after confirmation. Rename and delete must reopen the refreshed dashboard; opening a session is the only dashboard action that exits into a new Pi conversation. The fresh-conversation seed states that the global handoff may describe previously selected work and that the selected plan is authoritative. `/kanban pause`, `/kanban unpause`, and `/kanban remove` act only on the current durable selection; remove is permanent and asks for confirmation.
 
@@ -184,11 +212,17 @@ without touching the run identity, stage or main conversation. Keep external sch
 
 `./init.sh` is read-only and reports session context, branch, recent commits, and working tree. `./init.sh --check` validates v4 state selection, the absence of saved Pi conversation paths, and active plans; checks the physical handoff line cap; runs `git diff --check`, `npm run typecheck`, and `npm test`; then prints an unexecuted suggested commit.
 
-`loop.validate` and `loop.metric` are the only commands Kanban itself executes, plus the opt-in `.kanban/hooks/{before,after}-iteration` scripts when `loop.hooks` is set. All of them run only inside a disposable iteration worktree and are never derived from `init.*`.
+Kanban executes only configured validate/metric, named job adapters and opt-in hooks, inside
+private worktrees and never derived from `init.*`. Model parameters go via JSON stdin, not shell
+interpolation. Submission keys, frozen source/config and reserved budgets precede submission;
+uncertain results require reconciliation.
 
 Measurement may be arbitrarily slow, which shapes three behaviors worth keeping in mind when changing this area: `loop.measureTimeoutMs` bounds one command's entire wait (queue time included, for a scheduler-backed measurement); `loop.baselineMetric` replaces the baseline measurement with a value the operator already has; and `loop.audit` snapshots every attempt onto `kanban-audit/<base>` because a disposable worktree is not a place to leave evidence. Single-shot Pi modes await the run through `isSingleShot`, so `pi -p "/kanban implement"` does not exit out from under an armed loop.
 
-Init commands come from config (`.kanban/config.json`, `"auto"` resolves to an executable `./init.sh`) and appear only in the implement kickoff, the completion text, and the handoff header when configured. Only the autoresearch worktree may run `git add`/`git commit`, and only for a validated, accepted candidate on its private branch. Final completion may stage experiment-owned paths, but no extension code commits the user's checkout.
+Init commands come from config and appear only in kickoff/completion/handoff rules. Private
+detached worktrees may stage/commit immutable source snapshots; accepted source alone advances
+the experiment branch. Audit can snapshot rejected work on its separate ref. Final completion
+may stage experiment-owned paths, but no extension code commits the user's checkout.
 
 Before submitting changes, run:
 

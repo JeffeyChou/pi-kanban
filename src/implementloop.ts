@@ -5,6 +5,10 @@ import { join } from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { readPlan } from "./artifacts.js";
 import type { KanbanConfig, LoopConfig } from "./config.js";
+import { runCoordinator, type RunCoordinator } from "./coordinator.js";
+import { readCoordination, updateCoordination } from "./coordinationstore.js";
+import type { IterationSessionFactory } from "./iterationsession.js";
+import type { RunJobCommand } from "./jobs.js";
 import {
   appendLoopLog,
   iterationWorktreePath,
@@ -25,11 +29,9 @@ import { beginLoopProgress, updateLoopProgress } from "./liveprogress.js";
 import { startLoopWidget } from "./ui.js";
 import {
   armImplementLoop,
-  loopChildFailed,
   type LoopRunDeps,
   type LoopRunHandle,
 } from "./orchestrator.js";
-import { implementLoopPrompt, parseImplementLoopOutput } from "./prompts.js";
 import { load } from "./store.js";
 import { readWorkfile, workfileBase, type Workfile } from "./workfile.js";
 import {
@@ -97,9 +99,14 @@ export type LoopStart =
 export interface ImplementLoopDeps extends LoopRunDeps {
   /** Injectable for tests; defaults to the real command runner. */
   measure?: typeof measure;
+  /** Injectable execution seams; production always uses the persistent coordinator. */
+  coordinate?: RunCoordinator;
+  sessionFactory?: IterationSessionFactory;
+  jobCommand?: RunJobCommand;
 }
 
 interface LoopSetup {
+  coordinatorRevision?: number;
   handle: LoopRunHandle;
   config: KanbanConfig;
   loop: LoopConfig;
@@ -113,10 +120,13 @@ interface LoopSetup {
   prompt: string;
   baseline: MeasureOutcome;
   measure: typeof measure;
+  coordinate: RunCoordinator;
+  sessionFactory?: IterationSessionFactory;
+  jobCommand?: RunJobCommand;
 }
 
 function fitnessConfigured(loop: LoopConfig): boolean {
-  return Boolean(loop.validate?.trim() || loop.metric?.trim());
+  return Boolean(loop.validate?.trim() || loop.metric?.trim() || Object.keys(loop.jobs ?? {}).length);
 }
 
 function better(
@@ -149,15 +159,17 @@ export function decide(
   bestMetric: number | undefined,
   agentDecision: "keep" | "revert" = "keep",
 ): Decision {
+  const hasMetric = Boolean(loop.metric?.trim() || (Object.keys(loop.jobs ?? {}).length &&
+    (loop.metric_name || loop.target !== undefined || outcome.metric !== undefined)));
   if (!outcome.validationPass)
     return { keep: false, failureReason: "the validation command failed" };
-  if (loop.metric?.trim() && (outcome.metricUnmeasured || outcome.metric === undefined))
+  if (hasMetric && (outcome.metricUnmeasured || outcome.metric === undefined))
     return { keep: false, failureReason: "the metric could not be measured" };
   if (loop.decisionPolicy === "agent-with-validation")
     return agentDecision === "keep"
       ? { keep: true }
       : { keep: false, failureReason: "the experiment agent chose revert" };
-  if (!loop.metric?.trim()) return { keep: true };
+  if (!hasMetric) return { keep: true };
   const metric = outcome.metric;
   if (metric === undefined || !better(metric, bestMetric, loop.direction))
     return {
@@ -251,12 +263,20 @@ async function openWorktree(
 ): Promise<{ ok: true; path: string } | { ok: false; error: string }> {
   const cwd = setup.handle.ctx.cwd;
   const path = iterationWorktreePath(cwd, setup.base, iteration);
+  const saved = await readCoordination(cwd, setup.base);
+  if (saved?.iteration === iteration && saved.status !== "finished" && saved.worktree === path) {
+    const head = await headCommit(path);
+    if (head !== bestCommit) return { ok: false, error: "Recoverable iteration worktree moved; inspect it before resuming" };
+    await registerWorktree(cwd, setup.base, { path, pid: process.pid, startedAt: new Date().toISOString(), retain: true });
+    return { ok: true, path };
+  }
   const created = await createDetachedWorktree(cwd, bestCommit, path);
   if (!created.ok) return { ok: false, error: created.error ?? "git worktree add failed" };
   await registerWorktree(cwd, setup.base, {
     path,
     pid: process.pid,
     startedAt: new Date().toISOString(),
+    ...(setup.coordinate === runCoordinator ? { retain: true } : {}),
   });
   return { ok: true, path };
 }
@@ -286,7 +306,7 @@ interface LandOutcome {
  * atomic per invocation, and (4) an atomic `<base>.landed` marker written BEFORE the advancing
  * mutate so a re-run never double-applies.
  */
-async function land(setup: LoopSetup, patch: string): Promise<LandOutcome> {
+async function land(setup: LoopSetup, patch: string, alreadyLocked = false): Promise<LandOutcome> {
   const cwd = setup.handle.ctx.cwd;
   const sha = await writeBestPatch(cwd, setup.base, patch);
   const marker = await readLandedMarker(cwd, setup.base);
@@ -306,8 +326,11 @@ async function land(setup: LoopSetup, patch: string): Promise<LandOutcome> {
   }
   if (modified.length)
     return { landed: false, reason: "the working tree has uncommitted changes to tracked files" };
-  const checked = await setup.handle.check("implement");
-  if (!checked.ok) return { landed: false, reason: `the session ${checked.reason}` };
+  if (!alreadyLocked) {
+    const checked = await setup.handle.check("implement");
+    if (!checked.ok) return { landed: false, reason: `the session ${checked.reason}` };
+    await verifyGoalForLanding(setup);
+  }
 
   const applied = await landPatch(cwd, patch);
   if (!applied.ok)
@@ -381,6 +404,8 @@ interface IterationOutput {
   /** Set when the run must stop without recording anything more. */
   stop?: LoopOutcomeKind;
   stopMessage?: string;
+  metricReset?: boolean;
+  baselineMetric?: number;
 }
 
 async function runIteration(
@@ -402,57 +427,40 @@ async function runIteration(
   });
 
   const opened = await openWorktree(setup, input.iteration, input.bestCommit);
-  if (!opened.ok) return discarded(opened.error, `Could not set up the experiment: ${opened.error}.`);
+  if (!opened.ok) return { ...discarded(opened.error), stop: "stopped", stopMessage: `Could not restore the experiment worktree: ${opened.error}` };
   const worktree = opened.path;
   try {
     updateLoopProgress(setup.handle.signal, { iteration: input.iteration, best: input.bestMetric });
     setup.handle.status(
       `kanban implement: iteration ${input.iteration}/${setup.loop.maxIterations} — child session`,
     );
-    const outcome = await setup.handle.child({
-      prompt: implementLoopPrompt({
-        title: setup.handle.title,
-        prompt: setup.prompt,
-        ...(setup.spec ? { spec: setup.spec } : {}),
-        ...(input.lessons ? { lessons: input.lessons } : {}),
-        iteration: input.iteration,
-        maxIterations: setup.loop.maxIterations,
-        ...(setup.loop.validate ? { validate: setup.loop.validate } : {}),
-        ...(setup.loop.metric
-          ? {
-              hasMetric: true,
-              direction: setup.loop.direction,
-              decisionPolicy: setup.loop.decisionPolicy,
-              ...(setup.loop.metric_name ? { metricName: setup.loop.metric_name } : {}),
-              ...(setup.loop.target === undefined ? {} : { target: setup.loop.target }),
-              ...(input.bestMetric === undefined ? {} : { bestMetric: input.bestMetric }),
-            }
-          : {}),
-        ...(input.hookNote ? { hookNote: input.hookNote } : {}),
-      }),
-      cwd: worktree,
-      tools: IMPLEMENT_CHILD_TOOLS,
-      label: `implement ${input.iteration}/${setup.loop.maxIterations}`,
-    });
-    if (outcome.result.aborted || setup.handle.signal.aborted)
-      return { ...discarded("the run was aborted"), stop: "aborted" };
-    if (loopChildFailed(outcome.result)) {
-      const detail = `${outcome.result.errorKind ?? "other"}${outcome.result.error ? `: ${outcome.result.error}` : ""}`;
-      // A DISCARD per plan §2, EXCEPT for an unresolvable model: that is a configuration error
-      // rather than an experiment outcome, and every further iteration would fail identically.
-      if (outcome.result.errorKind === "model")
-        return {
-          ...discarded(`the implement child could not run (${detail})`),
-          stop: "failure",
-          stopMessage: `the implement model did not resolve (${detail}) — fix models.implement and re-run /kanban implement`,
-        };
-      return discarded(
-        `the implement child failed (${detail})`,
-        `The child session failed (${detail}); no hypothesis was tested.`,
-      );
+    let outcome;
+    try {
+      outcome = await setup.coordinate({
+        handle: setup.handle, base: setup.base, iteration: input.iteration, worktree,
+        goal: setup.prompt, spec: setup.spec ?? "", loop: setup.loop, model: setup.handle.model(),
+        bestMetric: input.bestMetric, lessons: input.lessons, hookNote: input.hookNote,
+        factory: setup.sessionFactory, command: setup.jobCommand, measure: setup.measure,
+      });
+    } catch (error) {
+      const message = `${String(error)}${/model/i.test(String(error)) ? "; check models.implement before resuming" : ""}`;
+      return { ...discarded(message), stop: "failure", stopMessage: message };
     }
-
-    const parsed = parseImplementLoopOutput(outcome.result.text);
+    if (setup.handle.signal.aborted)
+      return { ...discarded("the run was aborted"), stop: "aborted" };
+    if (outcome.stop) return { ...discarded(outcome.stop), stop: "stopped", stopMessage: outcome.stop };
+    const current = await readCoordination(cwdFor(setup), setup.base);
+    if (current && (current.pendingRevision || !current.finish || current.revision !== outcome.revision))
+      return { ...discarded("User control arrived before iteration acceptance"), stop: "stopped", stopMessage: "A user control change is pending; resume the saved coordinator" };
+    if (current) setup.coordinatorRevision = outcome.revision;
+    setup.loop = outcome.loop; setup.prompt = outcome.goal; setup.spec = outcome.spec;
+    setup.auditRef = setup.loop.audit ? setup.auditRef ?? `kanban-audit/${setup.base}` : undefined;
+    setup.manifest.auditRef = setup.auditRef;
+    if (outcome.metricReset) {
+      input.bestMetric = outcome.baselineMetric;
+      setup.baseline.metric = outcome.baselineMetric;
+    }
+    const parsed = outcome;
     await setup.handle.agents("implement", []);
     // The candidate is captured BEFORE measuring, so measurement debris (build output, caches)
     // can never enter the patch.
@@ -467,15 +475,11 @@ async function runIteration(
       );
     }
     setup.handle.status(`kanban implement: iteration ${input.iteration}/${setup.loop.maxIterations} — measuring candidate`);
-    const measured = await setup.measure(worktree, setup.loop, setup.handle.signal, {
-      KANBAN_ITERATION: String(input.iteration),
-      KANBAN_MAX_ITERATIONS: String(setup.loop.maxIterations),
-      KANBAN_BASE: setup.base,
-      ...(input.bestMetric === undefined ? {} : { KANBAN_BEST_METRIC: String(input.bestMetric) }),
-    });
+    const measured = outcome.measured;
     if (setup.handle.signal.aborted)
       return { ...discarded("the run was aborted"), stop: "aborted" };
     const decision = decide(setup.loop, measured, input.bestMetric, parsed.decision);
+    const incremental = await capturePatch(worktree, input.bestCommit);
     const stat = candidate.trim() ? await patchStat(worktree, candidate) : "";
     const changed = [stat.trim(), parsed.rationale].filter(Boolean).join("\n") || undefined;
     // The audit snapshot is taken for every measured attempt, before the keep/discard split:
@@ -483,14 +487,14 @@ async function runIteration(
     // is about to be destroyed.
     const auditCommit = await snapshotAudit(setup, {
       iteration: input.iteration,
-      worktree,
+      worktree: outcome.auditWorktree ?? worktree,
       parent: input.auditParent ?? input.bestCommit,
       decision: decision.keep ? "keep" : "discard",
       ...(measured.metric === undefined ? {} : { metric: measured.metric }),
       validation: measured.validationPass,
     });
 
-    if (!candidate.trim())
+    if (!incremental.trim() && !outcome.evidence)
       return {
         record: {
           iteration: input.iteration,
@@ -528,15 +532,24 @@ async function runIteration(
           }),
       verdict: parsed.verdict,
       at,
+      revision: outcome.revision,
+      ...(!incremental.trim() && outcome.evidence ? { evidenceOnly: true } : {}),
     };
     let commit: string | undefined;
-    if (decision.keep) {
-      const committed = await commitExperiment(
-        worktree,
-        setup.handle.ctx.cwd,
-        setup.branch,
-        `kanban-autoresearch: ${setup.handle.title} (iteration ${input.iteration})`,
-      );
+    if (decision.keep && incremental.trim()) {
+      // Commit the captured source in a clean worktree, never measurement debris.
+      const commitPath = join(cwdFor(setup), ".kanban", "worktrees", setup.base, `${input.iteration}-accepted`);
+      const opened = await createDetachedWorktree(cwdFor(setup), input.bestCommit, commitPath);
+      if (!opened.ok) throw new Error(opened.error);
+      let committed;
+      try {
+        const applied = await landPatch(commitPath, incremental);
+        if (!applied.ok) throw new Error(applied.error);
+        committed = await commitExperiment(
+          commitPath, setup.handle.ctx.cwd, setup.branch,
+          `kanban-autoresearch: ${setup.handle.title} (iteration ${input.iteration})`,
+        );
+      } finally { await removeWorktreeForce(cwdFor(setup), commitPath); }
       if (!committed.ok || !committed.commit) {
         record.decision = "discard";
         record.failureReason = `the accepted experiment could not be committed (${committed.error ?? "unknown git error"})`;
@@ -555,10 +568,22 @@ async function runIteration(
       ...(measured.metric === undefined ? {} : { metric: measured.metric }),
       ...(auditCommit ? { auditCommit } : {}),
       ...(commit ? { commit } : {}),
+      metricReset: outcome.metricReset,
+      baselineMetric: outcome.baselineMetric,
     };
   } finally {
-    await closeWorktree(setup, worktree);
+    const saved = await readCoordination(cwdFor(setup), setup.base);
+    if (!saved || saved.status === "finished") await closeWorktree(setup, worktree);
   }
+}
+
+function cwdFor(setup: LoopSetup): string { return setup.handle.ctx.cwd; }
+
+async function verifyGoalForLanding(setup: LoopSetup): Promise<void> {
+  if (setup.coordinatorRevision === undefined) return;
+  const current = await readCoordination(cwdFor(setup), setup.base);
+  if (!current || current.token !== setup.handle.token || current.pendingRevision || !current.finish || current.revision !== setup.coordinatorRevision)
+    throw new Error("The goal changed before landing; resume its saved coordinator before completion");
 }
 
 /**
@@ -631,8 +656,8 @@ async function driveLoop(setup: LoopSetup): Promise<LoopResult> {
       bestCommit,
       ...(setup.auditRef === undefined ? {} : { auditRef: setup.auditRef }),
       ...(auditCommit === undefined ? {} : { auditCommit }),
-      ...(setup.baseline.metric === undefined ? {} : { baselineMetric: setup.baseline.metric }),
-      ...(bestMetric === undefined ? {} : { bestMetric }),
+      baselineMetric: setup.baseline.metric,
+      bestMetric,
       nextIteration,
       status,
       updatedAt: new Date().toISOString(),
@@ -685,13 +710,21 @@ async function driveLoop(setup: LoopSetup): Promise<LoopResult> {
       hookNote,
       auditParent: auditCommit,
     });
+    if (outcome.stop && outcome.stop !== "failure" && outcome.stop !== "exhausted") {
+      stopped = { kind: outcome.stop, message: outcome.stopMessage };
+      break;
+    }
     if (outcome.auditCommit) auditCommit = outcome.auditCommit;
+    if (outcome.metricReset) {
+      bestMetric = outcome.baselineMetric;
+      await updateCoordination(cwd, setup.base, setup.handle.title, setup.handle.token, (value) => { value.metricReset = false; });
+    }
     records.push(outcome.record);
     await appendLoopLog(cwd, setup.base, outcome.record);
     lessons = await renderLivingSummary(cwd, setup.base, await readLoopLog(cwd, setup.base));
 
-    if (outcome.record.decision === "keep" && outcome.commit) {
-      bestCommit = outcome.commit;
+    if (outcome.record.decision === "keep" && (outcome.commit || outcome.record.evidenceOnly)) {
+      if (outcome.commit) bestCommit = outcome.commit;
       bestPatch = await patchBetweenCommits(cwd, setup.baseCommit, bestCommit);
       if (outcome.metric !== undefined) bestMetric = outcome.metric;
       streak = 0;
@@ -699,7 +732,7 @@ async function driveLoop(setup: LoopSetup): Promise<LoopResult> {
       success =
         outcome.verdict === "complete" &&
         outcome.validationPass &&
-        (!setup.loop.metric?.trim() || targetReached(outcome.metric, setup.loop));
+        targetReached(outcome.metric, setup.loop);
     } else {
       streak += 1;
     }
@@ -763,7 +796,7 @@ async function driveLoop(setup: LoopSetup): Promise<LoopResult> {
       ...(stopped.message ? { message: stopped.message } : {}),
     };
   }
-  if (!bestPatch.trim()) {
+  if (!bestPatch.trim() && !success) {
     await checkpoint("failure", setup.manifest.nextIteration);
     const message =
       stopped?.message ??
@@ -773,9 +806,9 @@ async function driveLoop(setup: LoopSetup): Promise<LoopResult> {
   }
 
   const kind: LoopOutcomeKind = success ? "success" : "exhausted";
-  const landing = await land(setup, bestPatch);
-  if (!landing.landed) {
-    await checkpoint(kind === "success" ? "paused" : "exhausted", setup.manifest.nextIteration);
+  let landing: LandOutcome = kind === "success" ? { landed: false } : await land(setup, bestPatch);
+  if (kind !== "success" && !landing.landed) {
+    await checkpoint("exhausted", setup.manifest.nextIteration);
     const message = `could not land the winning patch (${landing.reason ?? "unknown reason"}); apply .kanban/loop/${setup.base}.patch yourself`;
     setup.handle.notify(`Kanban implement loop for “${setup.handle.title}”: ${message}.`, "error");
     return { kind, iterations: records.length, landed: false, advanced: false, message };
@@ -792,19 +825,32 @@ async function driveLoop(setup: LoopSetup): Promise<LoopResult> {
     return { kind, iterations: records.length, landed: true, advanced: false, message };
   }
 
-  const committed = await setup.handle.commit(
-    "implement",
-    implementSection(setup, kind, records, true),
-  );
+  let committed;
+  try {
+    committed = await setup.handle.commit(
+      "implement", implementSection(setup, kind, records, true), undefined,
+      async () => {
+        await verifyGoalForLanding(setup);
+        landing = bestPatch.trim() ? await land(setup, bestPatch, true) : { landed: true };
+        if (!landing.landed) throw new Error(`could not land the winning patch: ${landing.reason}`);
+      },
+    );
+  } catch (error) {
+    await checkpoint("paused", setup.manifest.nextIteration);
+    const message = `${String(error)}. Saved source and results were retained.`;
+    setup.handle.notify(message, "warning");
+    return { kind: "stopped", iterations: records.length, landed: landing.landed, advanced: false, message };
+  }
   if (!committed.ok) {
     setup.handle.commitStop("implement", committed.reason);
-    const message =
-      "the winning patch is in your working tree (uncommitted) but the stage could not be advanced; advance it yourself with kanban_update stage_complete";
+    const message = landing.landed
+      ? "the winning patch is in your working tree (uncommitted) but the stage could not be advanced; advance it yourself with kanban_update stage_complete"
+      : `the session ${committed.reason}; the saved result was not landed or advanced`;
     setup.handle.notify(`Kanban implement loop for “${setup.handle.title}”: ${message}.`, "error");
-    return { kind, iterations: records.length, landed: true, advanced: false, message };
+    return { kind, iterations: records.length, landed: landing.landed, advanced: false, message };
   }
   await checkpoint("success", setup.manifest.nextIteration);
-  const message = `implemented in ${records.length} iteration(s) on ${setup.branch}; the accepted patch is in your working tree (uncommitted) and the session moved to critique — run /kanban open to review it`;
+  const message = `implemented in ${records.length} iteration(s) on ${setup.branch}; ${bestPatch.trim() ? "the accepted patch is in your working tree (uncommitted)" : "validated evidence is retained without a source commit"} and the session moved to critique — run /kanban open to review it`;
   setup.handle.notify(`Kanban implement loop for “${setup.handle.title}”: ${message}.`, "info");
   return { kind, iterations: records.length, landed: true, advanced: true, message };
 }
@@ -849,7 +895,7 @@ export async function startImplementLoop(
   title: string,
   deps: ImplementLoopDeps,
 ): Promise<LoopStart> {
-  const loop = deps.config.loop;
+  let loop = deps.config.loop;
   if (!loop.enabled)
     return refuse(
       ctx,
@@ -858,7 +904,7 @@ export async function startImplementLoop(
   if (!fitnessConfigured(loop))
     return refuse(
       ctx,
-      "The Kanban implement loop needs a fitness signal: set loop.validate (a command whose exit code decides) or loop.metric in /kanban config.",
+      "The Kanban implement loop needs a fitness signal: set loop.validate (a command whose exit code decides), loop.metric, or managed loop.jobs in /kanban config.",
     );
 
   const state = await load(ctx.cwd);
@@ -892,6 +938,10 @@ export async function startImplementLoop(
     );
 
   const base = workfileBase(session.planPath);
+  // Approved live revisions are campaign state, not necessarily a repository-config edit.
+  // Restore their budgets and adapters before deciding whether another iteration can run.
+  const savedCoordinator = await readCoordination(ctx.cwd, base);
+  if (savedCoordinator) loop = savedCoordinator.loop;
   const existing = await readLoopRun(ctx.cwd, base);
   const baseCommit = existing?.baseCommit ?? currentHead;
   if (existing && currentHead !== baseCommit)
@@ -949,15 +999,15 @@ export async function startImplementLoop(
         metricUnmeasured: false,
       };
       manifest = { ...existing, status: "running", updatedAt: new Date().toISOString() };
-    } else if (loop.baselineMetric !== undefined) {
+    } else if (loop.baselineMetric !== undefined || (!loop.validate && !loop.metric && Object.keys(loop.jobs ?? {}).length)) {
       // A configured baseline is already-recorded evidence. Re-deriving it would spend another
       // full measurement — for an expensive fitness command, hours of wall-clock or a scheduler
       // allocation — to learn a number the operator already supplied.
-      handle.status(`kanban implement: baseline ${loop.baselineMetric} taken from config`);
+      handle.status(loop.baselineMetric === undefined ? "kanban implement: acceptance through managed jobs" : `kanban implement: baseline ${loop.baselineMetric} taken from config`);
       baseline = {
         validationPass: true,
         tail: "",
-        metric: loop.baselineMetric,
+        ...(loop.baselineMetric === undefined ? {} : { metric: loop.baselineMetric }),
         metricUnmeasured: false,
       };
       const now = new Date().toISOString();
@@ -1041,6 +1091,9 @@ export async function startImplementLoop(
       prompt: plan?.prompt?.trim() || title,
       baseline,
       measure: measureFn,
+      coordinate: deps.coordinate ?? runCoordinator,
+      sessionFactory: deps.sessionFactory,
+      jobCommand: deps.jobCommand,
     };
     updateLoopProgress(handle.signal, { baseline: baseline.metric, best: manifest.bestMetric });
 

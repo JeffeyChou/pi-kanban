@@ -120,6 +120,23 @@ Iteration count measures attempts, not goal completion. When implementation is a
 the same dashboard shows saved checkpoints and agents; read actual output in the main
 conversation or the external scheduler that owns the child.
 
+### Steering a live implement iteration
+
+With the loop enabled, one persistent coordinator owns each iteration and its worker/reviewer
+lanes and configured jobs. Main chat must not launch competing repair agents. Query status on
+demand, and use `kanban_control` to deliver user-requested `steer`, `retry`, `reply`, or `revise`.
+For goal/settings/scope changes, `revise` queues intent; the coordinator updates plan/spec under
+the lock, preserves useful siblings and revalidates older evidence. Pending revisions prevent
+new dispatch and stale final acceptance. Repairs happen within the current iteration and its
+campaign budgets, not a fixed retry cap. Worker completion is a candidate, not acceptance.
+
+`/kanban open` and Pi new/resume/fork preserve a live coordinator. Pause/quit/reload suspends
+local sessions and observation but preserves managed scheduler jobs and source snapshots.
+Resume through `/kanban implement`; it reconciles saved job keys before dispatching. Explicit
+stop/remove cancels jobs first and refuses cleanup if cancellation is unknown. Dormant control
+requests remain queued until resume. Legacy opaque batch commands need migration to
+[managed adapters](managed-jobs.md) for independent job recovery.
+
 ### The critique gate
 
 The gate runs a child (`read/grep/find/ls` plus the tool-computed diff) inside `stage_complete(critique)`. Its contract: end with `## critique`, first line `Gate: PASS` or `Gate: FAIL`, then `- ` issue bullets. Unparseable output counts as FAIL.
