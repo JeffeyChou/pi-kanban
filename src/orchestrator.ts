@@ -5,6 +5,8 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { readPlan, writePlan, type PlanSnapshot } from "./artifacts.js";
+import { appendAttention } from "./attention.js";
+import { networkEnabledFor, networkTools } from "./nettools.js";
 import { isSingleShot } from "./capabilities.js";
 import type { KanbanConfig, StageModelKey } from "./config.js";
 import {
@@ -273,6 +275,8 @@ async function runStageChild(
     cwd?: string;
     /** Overrides the read-only CHILD_TOOLS — the implement loop passes the write set. */
     tools?: readonly string[];
+    /** Workfile base, so a fetch can be recorded against the campaign that made it. */
+    base?: string;
     onStatus?: (line: string) => void;
     timeoutMs?: number;
   },
@@ -301,12 +305,21 @@ async function runStageChild(
       signal.addEventListener("abort", stopWaiting, { once: true });
       if (signal.aborted) stopWaiting();
     });
+    // A research stage without network cannot research: Pi has no built-in web tool and children
+    // run with extensions disabled, so nothing ambient reaches them either.
+    const custom = networkEnabledFor(deps.config.network, options.stage)
+      ? networkTools({
+          cwd: ctx.cwd, base: options.base ?? options.stage, lane: options.stage,
+          config: deps.config.network, signal,
+        })
+      : [];
     const child = deps.runChild({
       cwd: options.cwd ?? ctx.cwd,
       prompt: options.prompt,
       systemPrompt: stageSystemPrompt(options.stage),
       model: resolved.model,
       tools: [...(options.tools ?? CHILD_TOOLS)],
+      ...(custom.length ? { customTools: custom } : {}),
       signal,
       onStatus: (line) => {
         if (signal.aborted) return;
@@ -457,6 +470,7 @@ async function runSingleChildStage(
     label: stage,
     signal: run.signal,
     timeoutMs: run.deps.config.pipeline?.childTimeoutMs ?? 300_000,
+    base: workfileBase(session.planPath),
     onStatus: (line) => run.progress?.activity(label, line),
     prompt: stagePrompt(stage, {
       prompt: context.prompt,
@@ -476,7 +490,23 @@ async function runSingleChildStage(
     });
     return undefined;
   }
-  return parseStageOutput(stage, outcome.result.text);
+  const parsed = parseStageOutput(stage, outcome.result.text);
+  // A stage child that never emitted its `## <stage>` heading did not follow the output contract,
+  // so the body was salvaged from raw text. That used to be computed and discarded, which is how a
+  // malformed stage silently became the plan the next stage builds on.
+  if (parsed.parseWarning)
+    await reportStageWarning(run, session, stage,
+      `The ${stage} child did not emit its "## ${stage}" heading; its whole reply was recorded as the section body. Re-read the ${stage} section before trusting it.`);
+  return parsed;
+}
+
+/** Persist a stage-level warning so it outlives the toast and reaches /kanban check. */
+async function reportStageWarning(
+  run: RunContext, session: Session, stage: string, message: string,
+): Promise<void> {
+  if (run.signal.aborted) return;
+  run.ctx.ui.notify(`Kanban ${stage}: ${message}`, "warning");
+  await appendAttention(run.ctx.cwd, workfileBase(session.planPath), { source: stage, message });
 }
 
 function fastPathNote(): string {
@@ -542,6 +572,7 @@ async function driveResearch(run: RunContext, session: Session): Promise<boolean
         label,
         signal: run.signal,
         timeoutMs: run.deps.config.pipeline?.childTimeoutMs ?? 300_000,
+        base: workfileBase(session.planPath),
         onStatus: (line) => run.progress?.activity(label, line),
         prompt: stagePrompt("research", {
           prompt: context.prompt,
@@ -600,7 +631,8 @@ async function driveResearch(run: RunContext, session: Session): Promise<boolean
     return false;
   }
   if (succeeded < groups.length && !run.signal.aborted)
-    run.ctx.ui.notify(`Kanban research: ${succeeded}/${groups.length} workers succeeded; missing coverage is recorded for grill and compose.`, "warning");
+    await reportStageWarning(run, session, "research",
+      `${succeeded}/${groups.length} workers succeeded; missing coverage is recorded for grill and compose.`);
   const committed = await commitStage(run, "research", parts.join("\n\n"));
   return committed.ok;
 }

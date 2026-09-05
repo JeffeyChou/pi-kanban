@@ -5,21 +5,24 @@ import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { readPlan, writePlan } from "./artifacts.js";
+import { appendAttention } from "./attention.js";
 import { isSingleShot } from "./capabilities.js";
-import { validateLoopRevision, type LoopConfig } from "./config.js";
+import { validateLoopRevision, type LoopConfig, type NetworkConfig, type WorktreeConfig } from "./config.js";
 import {
   addCoordinatorEvent, coordinationLines, observeCoordinator, readCoordination,
-  unresolvedJob, updateCoordination, writeCoordination,
+  turnBudgetBlocker, unresolvedJob, updateCoordination, writeCoordination,
   type CoordinationState, type JobRecord, type LaneRecord,
 } from "./coordinationstore.js";
 import { COORDINATOR_SYSTEM, workerSystem } from "./coordinatorprompts.js";
+import { networkEnabledFor, networkTools } from "./nettools.js";
 import { createIterationSession, type IterationSession, type IterationSessionFactory } from "./iterationsession.js";
 import { JobManager, type RunJobCommand } from "./jobs.js";
 import { appendLiveOutput, linkLoopProgress, updateLoopProgress } from "./liveprogress.js";
 import { registerWorktree } from "./looplog.js";
 import { measure, type MeasureOutcome } from "./measure.js";
 import type { LoopRunHandle } from "./orchestrator.js";
-import { changedWorktreePaths, capturePatch, headCommit, landPatch, snapshotWorktree } from "./worktree.js";
+import { readCarried, type CarryResult } from "./carry.js";
+import { carryIntoWorktree, changedWorktreePaths, capturePatch, headCommit, landPatch, snapshotWorktree } from "./worktree.js";
 import { writeWorkfileSection } from "./workfile.js";
 
 export interface CoordinateInput {
@@ -30,6 +33,10 @@ export interface CoordinateInput {
   goal: string;
   spec: string;
   loop: LoopConfig;
+  /** Which untracked files reach a child worktree; see carry.ts. */
+  worktreeConfig: WorktreeConfig;
+  /** Outbound network granted to lane children, when enabled. */
+  network: NetworkConfig;
   model: Model<any>;
   bestMetric?: number;
   lessons?: string;
@@ -101,6 +108,7 @@ class IterationCoordinator {
   private measurementTask?: Promise<void>;
   private measurementController?: AbortController;
   private stopping = false;
+  private carriedReported = false;
   private taskController = new AbortController();
   private rosterKey?: string;
 
@@ -178,11 +186,35 @@ class IterationCoordinator {
     return hash(`${head}\n${await capturePatch(source, head)}`);
   }
 
+  /**
+   * Report carrying once per run.
+   *
+   * Carrying every untracked file is the default because a child that cannot see the operator's
+   * real configuration cannot do the work. But copying files nobody named into a worktree is
+   * exactly the kind of thing that should not happen quietly: an operator who did not expect their
+   * local `.env` in a dozen worktrees finds out here, on the first lane, not from a diff later.
+   */
+  private reportCarried(result: CarryResult): void {
+    if (this.carriedReported) return;
+    this.carriedReported = true;
+    const sample = result.carried.slice(0, 3).join(", ");
+    this.input.handle.notify(
+      `Kanban carried ${result.carried.length} untracked file(s) into its private worktrees (${sample}${result.carried.length > 3 ? ", …" : ""}). ` +
+      `They stay out of every candidate patch and audit commit. Narrow this with worktree.carry or worktree.carryExclude in /kanban config.` +
+      (result.skipped.length ? ` ${result.skipped.length} file(s) were too large and were skipped.` : ""),
+      "info",
+    );
+  }
+
   private async snapshot(source: string, label: string): Promise<{ path: string; commit: string; digest: string }> {
     if (!(await this.input.handle.check("implement")).ok) throw new Error("Session no longer active");
     const path = join(this.cwd, ".kanban", "worktrees", this.input.base, `${this.input.iteration}-${slug(label)}-${randomUUID().slice(0, 8)}`);
     const digest = await this.sourceIdentity(source);
     const commit = await snapshotWorktree(this.cwd, source, path);
+    // Carry before the lane starts: a child has no shell, so a file that is not here when it
+    // begins is a file it can only report as missing.
+    const carried = await carryIntoWorktree(this.cwd, path, this.input.worktreeConfig);
+    if (carried.carried.length) this.reportCarried(carried);
     await registerWorktree(this.cwd, this.input.base, { path, pid: process.pid, startedAt: new Date().toISOString(), retain: true });
     if (digest !== await this.sourceIdentity(source)) throw new Error("Source changed while preparing its snapshot; retry with current source");
     return { path, commit, digest };
@@ -315,6 +347,11 @@ class IterationCoordinator {
           } else { state.status = "blocked"; state.blocker = args.reason; }
         });
         this.input.handle.notify(`Kanban needs attention: ${args.reason}`, "warning");
+        await appendAttention(this.cwd, this.input.base, {
+          source: args.lane ?? "coordinator",
+          message: args.reason,
+          remedy: "/kanban say <message> to steer, or /kanban answer <lane> <message> for a lane question.",
+        });
         return "Blocker recorded. Continue independent work; a user answer will wake this session.";
       }),
     ];
@@ -360,12 +397,17 @@ class IterationCoordinator {
       if (!(lane.state === "ready" || (lane.state === "waiting" && lane.reply))) continue;
       if (!lane.dependsOn.every((name) => state.lanes[name]?.state === "accepted")) continue;
       const task = this.runLane(lane.name, lane.attempt).catch(async (error) => {
-        if (!this.signal.aborted) await this.change((value) => {
+        if (this.signal.aborted) return;
+        await this.change((value) => {
           const current = value.lanes[lane.name];
           if (current?.attempt !== lane.attempt || current.state === "cancelled") return;
           current.state = "failed"; current.error = String(error).slice(0, 2000);
           addCoordinatorEvent(value, "child_failed", current.error, lane.name);
         }).catch(() => undefined);
+        await appendAttention(this.cwd, this.input.base, {
+          source: lane.name,
+          message: `Lane failed: ${String(error).slice(0, 2000)}`,
+        });
       }).finally(() => { this.tasks.delete(lane.name); this.wake(); });
       this.tasks.set(lane.name, task);
     }
@@ -410,6 +452,13 @@ class IterationCoordinator {
       });
       return "Verdict recorded; end your response.";
     }));
+    // A lane that must acquire an upstream source has no shell and no other way out of the
+    // worktree. Granting the tools here, per lane, keeps that an explicit configuration choice.
+    if (networkEnabledFor(this.input.network, name))
+      customTools.push(...networkTools({
+        cwd: this.cwd, base: this.input.base, lane: name,
+        config: this.input.network, signal: controller.signal,
+      }));
     let session: IterationSession | undefined;
     try {
       session = await (this.input.factory ?? createIterationSession)({
@@ -420,9 +469,16 @@ class IterationCoordinator {
         output: (text) => appendLiveOutput(this.signal, `[${name}] ${text}`),
         activity: (text) => updateLoopProgress(this.signal, { activity: text }),
       });
+      // Naming the carried files matters more than it looks: they are untracked, so nothing in the
+      // checkout's history hints that they exist, and a child that does not know to look for a
+      // site profile will report the configuration as missing and stop.
+      const carried = await readCarried(lane.worktree);
+      const carriedNote = carried.length
+        ? `\nLocal files copied into this worktree (untracked in git, present and readable here): ${carried.join(", ")}`
+        : "";
       const message = lane.reply
         ? `Coordinator answer: ${lane.reply}\nContinue your task under goal revision ${state.revision}.`
-        : `Goal revision ${lane.revision}: ${state.goal}\nPlan:\n${state.spec}\nLane: ${name}\nTask: ${lane.task}\nAcceptance: ${lane.acceptance}\nClaims: ${lane.claims.join(", ") || "this private worktree"}\n${lane.sessionFile ? "Resume the saved session; inspect partial work before proceeding." : ""}`;
+        : `Goal revision ${lane.revision}: ${state.goal}\nPlan:\n${state.spec}\nLane: ${name}\nTask: ${lane.task}\nAcceptance: ${lane.acceptance}\nClaims: ${lane.claims.join(", ") || "this private worktree"}${carriedNote}\n${lane.sessionFile ? "Resume the saved session; inspect partial work before proceeding." : ""}`;
       await this.change((value) => {
         const current = value.lanes[name];
         if (current.attempt !== attempt || current.state === "cancelled") throw new Error("Lane attempt was cancelled");
@@ -700,13 +756,25 @@ class IterationCoordinator {
         let current = await this.read();
         if (current.finish && !current.pendingRevision) return this.result();
         const events = current.events.filter((event) => !event.handled);
+        // A user control is the operator's escape hatch out of an exhausted campaign. Charging it
+        // against the same budget that stranded the campaign makes the budget a one-way trap: the
+        // one instruction that could raise the limit is the one the limit refuses to deliver.
+        const userDriven = events.some((event) => event.kind.startsWith("user_"));
         if (events.length && !this.stopping) {
           const wakeBudget = current.pendingRevision?.request.loop?.maxCoordinatorTurns ?? current.loop.maxCoordinatorTurns;
-          if (wakeBudget !== undefined && current.coordinatorTurns >= wakeBudget) {
-            await this.change((value) => { value.status = "blocked"; value.blocker = "Campaign coordinator-turn budget exhausted"; });
-            return this.result("Campaign coordinator-turn budget exhausted");
+          if (!userDriven && wakeBudget !== undefined && current.coordinatorTurns >= wakeBudget) {
+            // Leave every event unhandled: a budget top-up must resume exactly where this stopped.
+            const reason = turnBudgetBlocker(current.coordinatorTurns, wakeBudget);
+            await this.change((value) => { value.status = "blocked"; value.blocker = reason; });
+            this.input.handle.notify(`Kanban needs attention: ${reason}`, "warning");
+            await appendAttention(this.cwd, this.input.base, {
+              source: "coordinator",
+              message: `${reason} ${events.length} event(s) are held unhandled and will be delivered on resume.`,
+              remedy: "/kanban go --more",
+            });
+            return this.result(reason);
           }
-          await this.change((value) => { value.coordinatorTurns++; if (events.some((event) => event.kind.startsWith("user_"))) { value.status = "running"; delete value.blocker; } });
+          await this.change((value) => { value.coordinatorTurns++; if (userDriven) { value.status = "running"; delete value.blocker; } });
           await this.coordinator.send(await this.packet(current, events));
           await this.change((value) => {
             const ids = new Set(events.map((event) => event.id));

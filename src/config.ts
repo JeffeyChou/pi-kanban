@@ -78,6 +78,42 @@ export interface LoopConfig {
   maxCoordinatorTurns?: number;
 }
 
+/**
+ * Which untracked files are copied into every private child worktree.
+ *
+ * A worktree is `git worktree add`, so it holds tracked files only. Anything gitignored — a site
+ * profile, a local `.env`, a credentials file the run genuinely needs — simply is not there, and a
+ * child (which has no shell) has no way to discover that the file it was told about exists one
+ * directory up. Carrying is how a real local configuration reaches the work.
+ */
+export interface WorktreeConfig {
+  /** "all" copies every untracked file, ignored ones included; a list carries only those globs. */
+  carry: "all" | "none" | string[];
+  /** Globs never carried, on top of the built-in heavy-directory list. */
+  carryExclude: string[];
+  /** Files larger than this are skipped, so a checkpoint or dataset cannot be copied N times. */
+  carryMaxBytes: number;
+}
+
+/**
+ * Outbound network for child agents.
+ *
+ * Children deliberately have no shell, so they have no `curl` either — and Pi ships no built-in
+ * web tool. Without this, a research stage cannot reach the network at all. Off by default: an
+ * agent that can fetch is a materially different trust proposition, and that has to be a choice.
+ */
+export interface NetworkConfig {
+  enabled: boolean;
+  /** Allowed hosts. Exact ("github.com") or one wildcard label ("*.github.com"). */
+  allow: string[];
+  maxBytes: number;
+  timeoutMs: number;
+  /** Lanes and stages granted the tools; empty means every lane once enabled. */
+  lanes: string[];
+  /** Search backend. Absent means web_search reports itself unconfigured instead of failing. */
+  search?: { endpoint: string; apiKeyEnv?: string };
+}
+
 export interface JobAdapterConfig {
   kind: "local" | "scheduled";
   /** Local command, or scheduler submit operation. No command comes from a child tool call. */
@@ -105,6 +141,8 @@ export interface KanbanConfig {
   /** Resolved init commands ("auto" already resolved against the repository). */
   init: InitConfig;
   loop: LoopConfig;
+  worktree: WorktreeConfig;
+  network: NetworkConfig;
 }
 
 export interface LoadedConfig {
@@ -126,6 +164,8 @@ interface RawConfig {
   piBin: string;
   init: RawInitConfig;
   loop: LoopConfig;
+  worktree: WorktreeConfig;
+  network: NetworkConfig;
 }
 
 interface ConfigLayer {
@@ -139,6 +179,8 @@ interface ConfigLayer {
   piBin?: string;
   init?: Partial<RawInitConfig>;
   loop?: Partial<LoopConfig>;
+  worktree?: Partial<WorktreeConfig>;
+  network?: Partial<NetworkConfig>;
 }
 
 const StageModelKeys: StageModelKey[] = [
@@ -178,6 +220,21 @@ const DepthSchema = Type.Union([Type.Literal("focused"), Type.Literal("deep")]);
 const DetailSchema = Type.Union([Type.Literal("plan"), Type.Literal("concise"), Type.Literal("detailed")]);
 const ChildTimeoutSchema = Type.Integer({ minimum: 1000, maximum: 3_600_000 });
 const FiniteNumberSchema = Type.Number();
+const CarrySchema = Type.Union([Type.Literal("all"), Type.Literal("none"), Type.Array(Type.String({ minLength: 1 }))]);
+const StringArraySchema = Type.Array(Type.String({ minLength: 1 }));
+const ByteLimitSchema = Type.Integer({ minimum: 0, maximum: 1_073_741_824 });
+const TimeoutSchema = Type.Integer({ minimum: 1000, maximum: 600_000 });
+const SearchSchema = Type.Union([
+  Type.Null(),
+  Type.Object({ endpoint: Type.String({ minLength: 1 }), apiKeyEnv: Type.Optional(Type.String({ minLength: 1 })) }, { additionalProperties: false }),
+]);
+const WorktreeValueSchemas = {
+  carry: CarrySchema, carryExclude: StringArraySchema, carryMaxBytes: ByteLimitSchema,
+};
+const NetworkValueSchemas = {
+  enabled: BooleanSchema, allow: StringArraySchema, maxBytes: ByteLimitSchema,
+  timeoutMs: TimeoutSchema, lanes: StringArraySchema, search: SearchSchema,
+};
 const PathListSchema = Type.Array(Type.String({ minLength: 1 }), { minItems: 1 });
 export const JobAdapterSchema = Type.Union([
   Type.Object({
@@ -273,9 +330,29 @@ const RawConfigSchema = Type.Object(
     piBin: StringSchema,
     init: Type.Object({ start: InitValueSchema, check: InitValueSchema }),
     loop: LoopSchema,
+    worktree: Type.Object({
+      carry: CarrySchema,
+      carryExclude: StringArraySchema,
+      carryMaxBytes: ByteLimitSchema,
+    }, { additionalProperties: false }),
+    network: Type.Object({
+      enabled: BooleanSchema,
+      allow: StringArraySchema,
+      maxBytes: ByteLimitSchema,
+      timeoutMs: TimeoutSchema,
+      lanes: StringArraySchema,
+      search: Type.Optional(Type.Object({
+        endpoint: Type.String({ minLength: 1 }),
+        apiKeyEnv: Type.Optional(Type.String({ minLength: 1 })),
+      }, { additionalProperties: false })),
+    }, { additionalProperties: false }),
   },
   { additionalProperties: false },
 );
+
+/** Also the fallback for a caller that predates the block; see carry.ts. */
+export const DEFAULT_WORKTREE: WorktreeConfig = { carry: "all", carryExclude: [], carryMaxBytes: 10_485_760 };
+export const DEFAULT_NETWORK: NetworkConfig = { enabled: false, allow: [], maxBytes: 5_000_000, timeoutMs: 30_000, lanes: [] };
 
 const defaults: RawConfig = {
   models: {
@@ -305,6 +382,8 @@ const defaults: RawConfig = {
     audit: false,
     autoResume: false,
   },
+  worktree: DEFAULT_WORKTREE,
+  network: DEFAULT_NETWORK,
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -343,6 +422,8 @@ function configLayer(
         "piBin",
         "init",
         "loop",
+        "worktree",
+        "network",
       ].includes(key)
     ) {
       unknown(warnings, source, key);
@@ -433,6 +514,33 @@ function configLayer(
       continue;
     }
 
+    if (key === "worktree" || key === "network") {
+      if (!isRecord(entry)) {
+        invalid(warnings, source, key);
+        continue;
+      }
+      const schemas: Record<string, unknown> =
+        key === "worktree" ? WorktreeValueSchemas : NetworkValueSchemas;
+      const block: Record<string, unknown> = {};
+      for (const [field, fieldValue] of Object.entries(entry)) {
+        const schema = schemas[field];
+        if (!schema) {
+          unknown(warnings, `${source}.${key}`, field);
+          continue;
+        }
+        if (!Value.Check(schema, fieldValue)) {
+          invalid(warnings, `${source}.${key}`, field);
+          continue;
+        }
+        // `search: null` is the documented way to clear a backend a lower layer configured.
+        if (field === "search" && fieldValue === null) continue;
+        block[field] = fieldValue;
+      }
+      if (key === "worktree") layer.worktree = block as Partial<WorktreeConfig>;
+      else layer.network = block as Partial<NetworkConfig>;
+      continue;
+    }
+
     if (key === "loop") {
       if (!isRecord(entry)) {
         invalid(warnings, source, key);
@@ -504,6 +612,8 @@ function mergeConfig(...layers: ConfigLayer[]): RawConfig {
       pipeline: { ...merged.pipeline, ...layer.pipeline },
       init: { ...merged.init, ...layer.init },
       loop: { ...merged.loop, ...layer.loop },
+      worktree: { ...merged.worktree, ...layer.worktree },
+      network: { ...merged.network, ...layer.network },
     }),
     defaults,
   );
@@ -607,6 +717,8 @@ export async function loadConfig(
         ...(check === undefined ? {} : { check }),
       },
       loop: { ...merged.loop },
+      worktree: { ...merged.worktree },
+      network: { ...merged.network },
     },
     warnings,
   };

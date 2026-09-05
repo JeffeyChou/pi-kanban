@@ -11,6 +11,8 @@
 import { execFile, spawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import { carryUntracked, carriedStagingPaths, isCarried, readCarried, type CarryResult } from "./carry.js";
+import type { WorktreeConfig } from "./config.js";
 
 export interface GitOutcome {
   ok: boolean;
@@ -130,6 +132,10 @@ export async function commitWorktreeSnapshot(cwd: string): Promise<string> {
   const parent = await headCommit(cwd);
   const added = await runGit(cwd, ["add", "-A"]);
   if (!added.ok || !parent) throw new Error(added.error ?? "Snapshot parent is missing");
+  // Carried files came from the operator's checkout, not from this lane. Staging them would put a
+  // gitignored site profile or credentials file into the snapshot lineage every candidate builds on.
+  const unstaged = await unstageCarried(cwd);
+  if (!unstaged.ok) throw new Error(unstaged.error);
   const tree = await runGit(cwd, ["write-tree"]);
   if (!tree.ok) throw new Error(tree.error);
   const commit = await runGitStdin(cwd, ["commit-tree", tree.stdout.trim(), "-p", parent], "Kanban private source snapshot\n");
@@ -158,11 +164,35 @@ export async function snapshotWorktree(main: string, source: string, destination
   }
 }
 
+/**
+ * Copy the operator's untracked files into a freshly created private worktree.
+ *
+ * Bound here so every caller shares one git seam and one exclusion manifest; `carry.ts` stays
+ * free of the git plumbing so it can be tested against a stub.
+ */
+/** Remove every carried path from the index, leaving the file itself in place. */
+async function unstageCarried(cwd: string): Promise<GitOutcome> {
+  const paths = await carriedStagingPaths(cwd);
+  if (!paths.length) return { ok: true };
+  const reset = await runGit(cwd, ["reset", "--quiet", "--", ...paths]);
+  return reset.ok ? { ok: true } : { ok: false, error: reset.error };
+}
+
+export async function carryIntoWorktree(
+  repo: string, worktree: string, config: WorktreeConfig | undefined,
+): Promise<CarryResult> {
+  return carryUntracked(repo, worktree, config, (cwd, args) => runGit(cwd, args));
+}
+
 export async function changedWorktreePaths(cwd: string): Promise<string[]> {
   const tracked = await runGit(cwd, ["diff", "--name-only", "-z", "HEAD"]);
   const added = await runGit(cwd, ["ls-files", "--others", "--exclude-standard", "-z"]);
   if (!tracked.ok || !added.ok) throw new Error(tracked.error ?? added.error);
-  return [...new Set((tracked.stdout + added.stdout).split("\0").filter(Boolean))];
+  // A carried file is not something the lane changed. Counting it would fail the `claims` guard
+  // for every lane, on files the child never touched.
+  const carried = await readCarried(cwd);
+  return [...new Set((tracked.stdout + added.stdout).split("\0").filter(Boolean))]
+    .filter((path) => !isCarried(path, carried));
 }
 
 /** Ensure the durable private experiment branch exists at `base`. */
@@ -249,6 +279,12 @@ export async function commitAudit(
       const forced = await runGit(worktreeCwd, ["add", "-A", "-f", "--", path]);
       if (!forced.ok) unmatched.push(path);
     }
+    // After the forced adds, not before: `auditPaths` force-stages gitignored evidence, and a
+    // carried file sitting under an audited directory would otherwise be published to the audit
+    // ref. An audit commit records what an iteration produced; a copy of a file the operator
+    // already has is not evidence.
+    const unstaged = await unstageCarried(worktreeCwd);
+    if (!unstaged.ok) return { ok: false, error: unstaged.error };
     const tree = await runGit(worktreeCwd, ["write-tree"]);
     if (!tree.ok) return { ok: false, error: tree.error };
     const created = await runGit(worktreeCwd, [
@@ -332,9 +368,13 @@ export async function capturePatch(worktreeCwd: string, base: string): Promise<s
 
   const parts: string[] = [];
   if (tracked.stdout.trim() !== "") parts.push(tracked.stdout);
+  // Carried files are the operator's own untracked content, copied in so the child could read it.
+  // Folding them into the candidate patch would land them back in the checkout as new files.
+  const carried = await readCarried(worktreeCwd);
   for (const file of untracked.stdout.split("\0")) {
     // Skip the trailing empty field and collapsed directory entries (`dir/`).
     if (file === "" || file.endsWith("/")) continue;
+    if (isCarried(file, carried)) continue;
     const added = await runGit(worktreeCwd, [
       "diff",
       "--no-index",

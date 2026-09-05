@@ -11,6 +11,7 @@ import type { KanbanConfig, LoopConfig } from "../src/config.js";
 import {
   IMPLEMENT_CHILD_TOOLS,
   decide,
+  resumeLoopConfig,
   startImplementLoop,
   type LoopResult,
 } from "../src/implementloop.js";
@@ -124,6 +125,8 @@ function config(overrides: Partial<KanbanConfig> = {}): KanbanConfig {
     piBin: "pi",
     init: {},
     loop: loop(),
+    worktree: { carry: "none", carryExclude: [], carryMaxBytes: 10_485_760 },
+    network: { enabled: false, allow: [], maxBytes: 5_000_000, timeoutMs: 30_000, lanes: [] },
     ...overrides,
   };
 }
@@ -1007,4 +1010,34 @@ test("the audit ref keeps every attempt and its evidence while the accepted comm
   } finally {
     await harnessed.cleanup();
   }
+});
+
+test("resuming a campaign takes budgets from live config but keeps its own adapters and fitness", () => {
+  const saved: LoopConfig = {
+    ...loop(),
+    validate: "bash scripts/verify_host.sh",
+    jobs: { host: { kind: "local", command: "python3 scripts/kanban_host_job.py" } },
+    maxCoordinatorTurns: 60,
+    maxChildRuns: 24,
+    maxSubmissions: 0,
+  };
+  const configured: LoopConfig = {
+    ...loop(),
+    validate: "npm test",
+    maxCoordinatorTurns: 200,
+    maxSubmissions: 4,
+  };
+
+  const merged = resumeLoopConfig(saved, configured);
+
+  // A spending limit is the operator's to raise, and raising it in config has to reach the run
+  // that needs it raised — otherwise an exhausted campaign has no way out at all.
+  assert.equal(merged.maxCoordinatorTurns, 200);
+  assert.equal(merged.maxSubmissions, 4);
+  // Not configured in the live layer, so the campaign's own value stands.
+  assert.equal(merged.maxChildRuns, 24);
+  // Campaign state wins for everything else: a config edit must not retroactively redefine what
+  // "accepted" meant for evidence this campaign already collected.
+  assert.equal(merged.validate, "bash scripts/verify_host.sh");
+  assert.deepEqual(merged.jobs, saved.jobs);
 });

@@ -856,16 +856,61 @@ test("/kanban implement refuses an enabled loop with no fitness signal", async (
   }
 });
 
-test("/kanban implement is only valid at the implement stage and reports a wrong verb", async () => {
+test("/kanban go refuses off-stage with the next command named, and rejects a bad argument", async () => {
   const cwd = await sandbox();
   try {
     const harness = extensionHarness();
     await addSession(cwd, "Not implementing", "pipeline");
     const ctx = context(cwd);
+    await harness.commands.get("kanban").handler("go", ctx);
+    const refusal = ctx.notifications.join("\n");
+    assert.match(refusal, /only runs at the implement stage/);
+    // A refusal that does not say what to do next is why this looked like a silent no-op.
+    assert.match(refusal, /\/kanban check/);
+    await harness.commands.get("kanban").handler("go nonsense", ctx);
+    assert.match(ctx.notifications.join("\n"), /Usage: \/kanban go \[stop \| --more/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("old command names keep working, and unknown ones point at the help", async () => {
+  const cwd = await sandbox();
+  try {
+    const harness = extensionHarness();
+    await addSession(cwd, "Not implementing", "pipeline");
+    const ctx = context(cwd);
+    // `implement` is the name operators already have in their fingers; it must still resolve.
     await harness.commands.get("kanban").handler("implement", ctx);
-    assert.match(ctx.notifications.join("\n"), /only valid at the implement stage/);
-    await harness.commands.get("kanban").handler("implement nonsense", ctx);
-    assert.match(ctx.notifications.join("\n"), /Usage: \/kanban implement \[stop\]/);
+    assert.match(ctx.notifications.join("\n"), /only runs at the implement stage/);
+
+    const unknown = context(cwd);
+    await harness.commands.get("kanban").handler("frobnicate", unknown);
+    assert.match(unknown.notifications.join("\n"), /No Kanban command named/);
+    assert.match(unknown.notifications.join("\n"), /\/kanban help/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("/kanban help lists every verb, its aliases, and the path through a session", async () => {
+  const cwd = await sandbox();
+  try {
+    const harness = extensionHarness();
+    const ctx = context(cwd);
+    await harness.commands.get("kanban").handler("help", ctx);
+    const help = ctx.notifications.join("\n");
+    // The old unknown-verb text omitted `steer` and `goal`, so two working commands were
+    // undiscoverable. Generating the listing from the table is what prevents that recurring.
+    for (const verb of ["new", "go", "check", "say", "answer", "goal", "config", "remove"])
+      assert.match(help, new RegExp(`/kanban ${verb}\\b`), `${verb} must be listed`);
+    assert.match(help, /A session, start to finish/);
+
+    const detail = context(cwd);
+    await harness.commands.get("kanban").handler("help go", detail);
+    const body = detail.notifications.join("\n");
+    assert.match(body, /--more/);
+    assert.match(body, /Also accepted: \/kanban implement/);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

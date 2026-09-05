@@ -328,6 +328,13 @@ export function implementKickoff(
     );
   lines.push(
     "",
+    // The saved coordinator's open items are invisible in the default status view, and a resume
+    // that walks straight into an unanswered question or an exhausted budget stops immediately —
+    // for a reason the agent then has no way to explain to the user.
+    "Coordinator handover: if a saved implement coordinator exists but is not live, call `kanban_status` with view `attention` BEFORE resuming it. That view lists the blocker, any child lane waiting on a question, failed jobs, and events not yet delivered. Answer a waiting lane with `kanban_control` action `reply` and its lane name; send general direction with action `steer`. A user control is always delivered, even when the campaign is out of coordinator turns. If the blocker says the coordinator-turn budget is exhausted, tell the user to run `/kanban go --more`; you cannot raise that budget from here.",
+  );
+  lines.push(
+    "",
     "Checkpoint contract: call `kanban_update` with `checkpoint` only at material milestones — a scope change, an agent-roster change, a meaningful work-summary change, or a new handoff note. Never call it per file, command, or tool call. Call `stage_complete` once the whole implementation is done and validated; that arms the critique gate.",
   );
   lines.push(

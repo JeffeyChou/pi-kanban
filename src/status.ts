@@ -1,14 +1,15 @@
 import { readPlan } from "./artifacts.js";
+import { readAttention } from "./attention.js";
 import { readLoopLog, readLoopRun } from "./looplog.js";
 import { displayText, loopProgress } from "./liveprogress.js";
 import { hasLiveRun } from "./orchestrator.js";
 import { readSnapshot, selectedSession } from "./store.js";
 import { getUsage, usageLines } from "./usage.js";
 import { readWorkfile, workfileBase } from "./workfile.js";
-import { coordinationLines, readCoordination } from "./coordinationstore.js";
+import { attentionItems, coordinationLines, readCoordination } from "./coordinationstore.js";
 
 export interface StatusQuery {
-  view?: "summary" | "output" | "results" | "plan";
+  view?: "summary" | "attention" | "output" | "results" | "plan";
   iteration?: number;
 }
 
@@ -31,6 +32,21 @@ export async function queryStatus(cwd: string, query: StatusQuery = {}): Promise
     const body = (await readWorkfile(cwd, base)).sections.compose;
     return displayText([...header, body ? `## compose\n${body}` : "No composed plan recorded."].join("\n\n")).slice(0, 24000);
   }
+  const attention = coordinator ? attentionItems(coordinator) : [];
+  if (query.view === "attention") {
+    const logged = await readAttention(cwd, 5).catch(() => []);
+    return displayText([...header, ...(attention.length
+      ? [`ATTENTION (${attention.length}) — nothing moves until these are answered:`,
+         ...attention.map((item) => `- ${item}`),
+         "",
+         "Answer a waiting lane with /kanban answer <lane> <message>, or send the coordinator a",
+         "general instruction with /kanban say <message>. A user message is always delivered, even",
+         "when the campaign is out of budget."]
+      : ["Nothing is waiting on you. No blocker, no unanswered lane question, no unhandled event."]),
+      ...(logged.length ? ["", "Recent escalations (.kanban/attention.md):", ...logged] : []),
+    ].join("\n")).slice(0, 12000);
+  }
+
   const chosen = query.iteration === undefined ? records.at(-1) : records.find((record) => record.iteration === query.iteration);
   if (query.iteration !== undefined && !chosen)
     return [...header, `Iteration ${query.iteration} has no completed record yet.`].join("\n");
@@ -54,6 +70,11 @@ export async function queryStatus(cwd: string, query: StatusQuery = {}): Promise
   }
   const usage = getUsage(cwd, session.title);
   return displayText([...header,
+    // Attention leads: a blocker or an unanswered child question is the only thing on this page
+    // that requires the reader to act, and burying it under telemetry is why it goes unread.
+    ...(attention.length ? [[`ATTENTION (${attention.length}) — see /kanban check attention:`,
+      ...attention.slice(0, 6).map((item) => `- ${item}`),
+      ...(attention.length > 6 ? [`- …and ${attention.length - 6} more`] : [])].join("\n")] : []),
     ...(live ? [`Activity: ${live.activity} (reported ${Math.max(0, Math.floor((Date.now() - live.updatedAt) / 1000))}s ago)`,
       `Iteration ${live.iteration}/${live.maxIterations} (attempt budget); ${live.childCount ?? (live.childRunning ? 1 : 0)} children running; ${live.jobCount ?? 0} jobs outstanding`,
       `Metric: baseline ${live.baseline ?? "—"}, latest ${live.latest ?? "—"}, best ${live.best ?? "—"}, target ${live.target ?? "not set"}`,

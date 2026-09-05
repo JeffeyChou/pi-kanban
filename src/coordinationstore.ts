@@ -216,13 +216,118 @@ export async function requestControl(cwd: string, base: string, title: string, r
   return `Control recorded (${request.action}); ${request.action === "revise" ? "goal revision is pending application" : "the coordinator will act on it"}.`;
 }
 
+/**
+ * What an operator should actually run next when no coordinator owns a process.
+ *
+ * "Use /kanban go to resume" is only true when resuming can succeed. Handing that advice to
+ * someone whose saved run is blocked sends them around a loop: the command they are told to run
+ * refuses for a reason nothing in the receipt reveals.
+ */
+export function resumeHint(value: CoordinationState | undefined): string {
+  if (!value) return "No coordinator is live in this Pi process; run /kanban go to start one.";
+  if (value.blocker)
+    return `No coordinator is live in this Pi process, and the saved run is blocked: ${blockerWithRemedy(value.blocker)}${
+      isTurnBudgetBlocker(value.blocker) ? "" : " Resolve that, then run /kanban go."}`;
+  return "No coordinator is live in this Pi process; run /kanban go to resume and apply it.";
+}
+
+/**
+ * Raise an exhausted coordinator-turn budget so a stalled campaign can resume where it stopped.
+ *
+ * The allowance is raised rather than the spent count reset, so `coordinatorTurns` stays an honest
+ * record of what the campaign has cost. This refuses on any other blocker: a top-up is for a
+ * spending limit, and must never paper over a campaign that stopped for a substantive reason.
+ */
+export async function grantCoordinatorTurns(
+  cwd: string, base: string, title: string, extra?: number,
+): Promise<{ granted: number; budget: number }> {
+  const result = await mutateAsync(cwd, async (board) => {
+    const session = board.sessions.find((item) => item.title === title);
+    if (!session || board.selectedSessionTitle !== title || session.stage !== "implement")
+      throw new Error("Select an implement session before granting coordinator turns");
+    const value = await readCoordination(cwd, base);
+    if (!value) throw new Error("There is no saved coordinator to resume");
+    const budget = value.loop.maxCoordinatorTurns;
+    if (budget === undefined)
+      throw new Error("This campaign has no coordinator-turn budget, so there is nothing to raise");
+    if (!isTurnBudgetBlocker(value.blocker))
+      throw new Error(value.blocker
+        ? `The campaign is blocked on something a turn budget cannot fix: ${value.blocker}`
+        : "The campaign is not blocked on its coordinator-turn budget");
+    const granted = extra ?? budget;
+    if (!Number.isInteger(granted) || granted < 1) throw new Error("Grant a positive whole number of turns");
+    value.loop.maxCoordinatorTurns = budget + granted;
+    value.status = "paused";
+    delete value.blocker;
+    addCoordinatorEvent(value, "budget_granted",
+      `Operator granted ${granted} more coordinator turns; budget is now ${value.loop.maxCoordinatorTurns}.`);
+    await writeCoordination(cwd, base, value);
+    return { granted, budget: value.loop.maxCoordinatorTurns };
+  });
+  wakeCoordinator(cwd, base);
+  return result.value;
+}
+
+/**
+ * The coordinator-turn budget is a cost guard, not a verdict on the work. Its blocker therefore
+ * has to name the remedy: an operator who only reads "budget exhausted" has no way to tell a
+ * spending limit apart from a campaign that genuinely cannot continue.
+ */
+export const TURN_BUDGET_BLOCKER = "Campaign coordinator-turn budget exhausted";
+
+export function turnBudgetBlocker(turns: number, budget: number): string {
+  return `${TURN_BUDGET_BLOCKER} (${turns}/${budget}). Run /kanban go --more for another ${budget} turns, or raise loop.maxCoordinatorTurns in /kanban config.`;
+}
+
+/** True for any blocker minted by the turn budget, including records written before the remedy text. */
+export function isTurnBudgetBlocker(blocker: string | undefined): boolean {
+  return Boolean(blocker?.startsWith(TURN_BUDGET_BLOCKER));
+}
+
+/**
+ * A blocker with its remedy attached.
+ *
+ * Campaigns blocked before the remedy text existed are exactly the ones that need it: they are
+ * stopped right now, and their record says only that a budget ran out.
+ */
+export function blockerWithRemedy(blocker: string): string {
+  return isTurnBudgetBlocker(blocker) && !blocker.includes("/kanban go --more")
+    ? `${blocker}. Run /kanban go --more to grant a fresh allowance and resume.`
+    : blocker;
+}
+
 export function unresolvedJob(job: JobRecord): boolean {
   return ["intent", "queued", "running", "unknown", "blocked"].includes(job.state);
 }
 
-export function coordinationLines(value: CoordinationState): string[] {
+/** Lanes and jobs an operator has to act on before the campaign can move again. */
+export function attentionItems(value: CoordinationState): string[] {
+  const unhandled = value.events.filter((event) => !event.handled);
   return [
-    `Coordinator: ${value.status} · goal revision ${value.revision}${value.pendingRevision ? " · revision pending" : ""}`,
+    ...(value.blocker ? [`BLOCKER: ${blockerWithRemedy(value.blocker)}`] : []),
+    ...Object.values(value.lanes)
+      .filter((lane) => lane.state === "waiting" && lane.question)
+      .map((lane) => `${lane.name} is waiting for an answer: ${lane.question} — /kanban answer ${lane.name} <message>`),
+    ...Object.values(value.lanes)
+      .filter((lane) => (lane.state === "blocked" || lane.state === "failed") && lane.error)
+      .map((lane) => `${lane.name} ${lane.state}: ${lane.error}`),
+    ...Object.values(value.jobs)
+      .filter((job) => unresolvedJob(job) && job.error)
+      .map((job) => `job ${job.name} ${job.state}: ${job.error}`),
+    ...unhandled.map((event) => `unhandled ${event.kind}${event.lane ? ` (${event.lane})` : ""} from ${event.at}: ${event.message.slice(0, 240)}`),
+  ];
+}
+
+export function coordinationLines(value: CoordinationState): string[] {
+  const turns = value.loop.maxCoordinatorTurns;
+  const unhandled = value.events.filter((event) => !event.handled).length;
+  return [
+    // The blocker is the whole reason a run stopped; printing only "blocked" leaves the operator
+    // with nothing to act on and no way to tell a spending limit from a real fault.
+    `Coordinator: ${value.status} · goal revision ${value.revision}${value.pendingRevision ? " · revision pending" : ""}` +
+      `${turns === undefined ? "" : ` · turns ${value.coordinatorTurns}/${turns}`}` +
+      `${unhandled ? ` · ${unhandled} event${unhandled === 1 ? "" : "s"} unhandled` : ""}`,
+    ...(value.blocker ? [`Blocker: ${blockerWithRemedy(value.blocker)}`] : []),
     `Jobs: ${Object.values(value.jobs).filter(unresolvedJob).length} outstanding · submissions ${value.submissions}${value.loop.maxSubmissions === undefined ? "" : `/${value.loop.maxSubmissions}`}`,
     ...Object.values(value.lanes).map((lane) => `${lane.name}: ${lane.state} · attempt ${lane.attempt}${lane.question ? ` · needs answer: ${lane.question}` : lane.error ? ` · ${lane.error}` : ""}`),
     ...Object.values(value.jobs).slice(-12).map((job) => `${job.name}: ${job.state}${job.externalId ? ` · job ${job.externalId}` : ""}${job.collected ? ` · evidence ${job.accepted ? "accepted" : "not accepted"}` : ""}${job.error ? ` · ${job.error}` : ""}`),

@@ -4,6 +4,32 @@ Kanban is a local [Pi](https://github.com/badlogic/pi-mono) extension for a sing
 
 Kanban is a Pi extension package, not a standalone service. Pi loads `src/index.ts` directly from `package.json`.
 
+## Getting started
+
+Five commands cover an entire session. `/kanban help` prints this list in-product, and
+`/kanban help <verb>` explains one command.
+
+```text
+/kanban new <brief>                 describe the work; planning runs on its own
+/kanban check                       where it got to, and anything waiting on you
+/kanban go                          run the implement stage
+/kanban say <message>               correct course while it runs
+/kanban answer <lane> <message>     unblock a child that asked a question
+/kanban complete                    archive it once the critique gate passes
+```
+
+Everything else is under `/kanban more`. Older command names (`create`, `implement`, `status`,
+`steer`, `experiments`) still work as aliases.
+
+Two things are worth knowing before the first run:
+
+- **Child agents have no shell and, by default, no network.** They read, search and write files
+  inside a private git worktree. Commands run only as configured `loop.jobs` adapters. Give a lane
+  outbound access with the `network` block below.
+- **A git worktree contains tracked files only.** Anything gitignored — a site profile, a local
+  `.env` — is copied in for you, and kept out of every candidate patch and audit commit. The
+  `worktree` block controls that.
+
 ## Install
 
 ```sh
@@ -47,20 +73,37 @@ If the repository has an executable `./init.sh`, the implement kickoff, final co
 
 ## Commands
 
-| Command | Behavior |
-| --- | --- |
-| `/kanban` | Opens the keyboard-driven Kanban dashboard. ↑/↓ or `j`/`k` previews a session's status; Enter selects a session and routes to `/kanban open`; Tab opens management mode, where Enter opens, `r` renames, and `x` permanently deletes after confirmation. Rename/delete return to the refreshed dashboard; only opening a session leaves it. |
-| `/kanban create <prompt>` | Generates a title, creates/selects the durable pipeline-mode session, and starts the pipeline. |
-| `/kanban open [title]` | Opens the selected plan in a clean Pi conversation. A live implement coordinator keeps running; the new chat is its control surface. Pipeline-owned planning stages re-run their current child. Blocked sessions must be unpaused. |
-| `/kanban implement` | At implement, starts/resumes the persistent iteration coordinator when `loop.enabled`; otherwise opens the normal agent-owned conversation. `stop` explicitly cancels managed jobs before stopping; unconfirmed cancellation retains the owner and recovery data. |
-| `/kanban steer <message>` / `/kanban goal <message>` | Sends direction to the coordinator, or queues a goal revision that blocks new dispatch and final acceptance until applied. |
-| `/kanban status [summary\|output\|results\|plan]` | Reads one snapshot without opening a dashboard, joining the background task, or changing state. Defaults to summary. |
-| `/kanban progress` / `/kanban experiments` | Opens the selected session's implement dashboard: goal, current activity, public child/measurement output, baseline/latest/best/target metric, recent metric trend, keep/revert history, validation, commits, and comments. ↑/↓ browses attempts; PgUp/PgDn scrolls the retained output; Escape closes the panel without stopping the loop. Agent-owned implementation shows saved checkpoints and its roster. |
-| `/kanban plan` | Opens a read-only, scrollable preview of the composed Markdown implementation plan without switching conversations. ↑/↓ scrolls; PgUp/PgDn pages; Escape closes. |
-| `/kanban config` | Opens `.kanban/config.json`. Valid loop changes queue a revision for the current campaign; disabling the loop affects future starts and does not silently cancel jobs. |
-| `/kanban pause` / `/kanban unpause` | Marks the currently selected session `blocked` or `active` without changing its stage. Pausing also aborts a live pipeline run and clears its token; unpausing restarts nothing. |
-| `/kanban remove` | Permanently deletes the currently selected session, its plan, and its workfile after confirmation (a live run is aborted first). |
-| `/kanban complete` | Escape hatch for the critique step: valid only while the plan carries a `pendingCompletion` record (a tool confirm path directed the session there). Confirms with the user, then archives like a normal critique completion. |
+Every command below is generated from one table in `src/index.ts`, which also drives `/kanban help`
+and the unknown-command message, so the three cannot drift apart.
+
+| Command | Aliases | Behavior |
+| --- | --- | --- |
+| `/kanban` | | Opens the keyboard-driven Kanban dashboard. ↑/↓ or `j`/`k` previews a session's status; Enter selects a session and routes to `/kanban open`; Tab opens management mode, where Enter opens, `r` renames, and `x` permanently deletes after confirmation. Rename/delete return to the refreshed dashboard; only opening a session leaves it. |
+| `/kanban new <brief>` | `create` | Generates a title, creates/selects the durable pipeline-mode session, and starts the pipeline. |
+| `/kanban open [title]` | | Opens the selected plan in a clean Pi conversation. A live implement coordinator keeps running; the new chat is its control surface. Pipeline-owned planning stages re-run their current child. Blocked sessions must be unpaused. |
+| `/kanban go [stop \| --more[=N]]` | `implement` | At implement, starts/resumes the persistent iteration coordinator when `loop.enabled`; otherwise opens the normal agent-owned conversation. `stop` explicitly cancels managed jobs before stopping; unconfirmed cancellation retains the owner and recovery data. |
+| `/kanban say <message>` / `/kanban goal <message>` | `steer` | Sends direction to the coordinator, or queues a goal revision that blocks new dispatch and final acceptance until applied. |
+| `/kanban check [attention\|summary\|output\|results\|plan]` | `status` | Reads one snapshot without opening a dashboard, joining the background task, or changing state. Defaults to summary. |
+| `/kanban progress` | `experiments` | Opens the selected session's implement dashboard: goal, current activity, public child/measurement output, baseline/latest/best/target metric, recent metric trend, keep/revert history, validation, commits, and comments. ↑/↓ browses attempts; PgUp/PgDn scrolls the retained output; Escape closes the panel without stopping the loop. Agent-owned implementation shows saved checkpoints and its roster. |
+| `/kanban plan` | | Opens a read-only, scrollable preview of the composed Markdown implementation plan without switching conversations. ↑/↓ scrolls; PgUp/PgDn pages; Escape closes. |
+| `/kanban config` | | Opens `.kanban/config.json`. Valid loop changes queue a revision for the current campaign; disabling the loop affects future starts and does not silently cancel jobs. |
+| `/kanban pause` / `/kanban unpause` | | Marks the currently selected session `blocked` or `active` without changing its stage. Pausing also aborts a live pipeline run and clears its token; unpausing restarts nothing. |
+| `/kanban remove` | | Permanently deletes the currently selected session, its plan, and its workfile after confirmation (a live run is aborted first). |
+| `/kanban complete` | | Escape hatch for the critique step: valid only while the plan carries a `pendingCompletion` record (a tool confirm path directed the session there). Confirms with the user, then archives like a normal critique completion. |
+| `/kanban answer <lane> <message>` | | Answers a child lane that is waiting on a question. Recorded durably and delivered on the next resume even when no coordinator is live. |
+| `/kanban help [verb]` | | Prints the command list and the path through a session, or the detail for one command. |
+| `/kanban more` | | Lists the commands beyond the everyday six. |
+
+`/kanban check attention` lists only what is waiting on you: the blocker with its remedy, any child
+lane that asked a question, failed jobs, and events the coordinator has not yet consumed. The
+default `summary` view leads with the same block, because a blocker buried under telemetry is a
+blocker nobody reads.
+
+`/kanban go --more` raises an exhausted coordinator-turn budget and resumes. It refuses on every
+other blocker, so it cannot be used to skip past a campaign that stopped for a substantive reason.
+
+Long output — every `check` view, `plan`, and `help` — is rendered in a scrollable panel rather
+than a notification, so it neither truncates nor disappears on the next redraw.
 
 The dashboard is rendered as a bordered editor-area panel, not a floating transcript overlay. Escape closes it. It never exposes internal identifiers because active sessions are selected by title.
 
@@ -96,9 +139,77 @@ The dashboard is rendered as a bordered editor-area panel, not a floating transc
     //   "metric": "…prints METRIC <name>=<value>", "metric_name": "score", "target": 100,
     //   "baselineMetric": 0,               // trust this instead of measuring the baseline
     //   "auditPaths": ["evidence"]         // force-added into each audit commit
+    //   "maxCoordinatorTurns": 60,         // see "When a campaign runs out of turns"
+    //   "maxChildRuns": 24, "maxSubmissions": 0, "maxConcurrentChildren": 3
+  },
+  "worktree": {                            // which local files reach a child worktree
+    "carry": "all",                        // "all" | "none" | ["cluster/*/site.env", …]
+    "carryExclude": [],                    // globs never carried
+    "carryMaxBytes": 10485760              // per-file cap; larger files are skipped
+  },
+  "network": {                             // outbound access for children; off by default
+    "enabled": false,
+    "allow": [],                           // "github.com" or "*.githubusercontent.com"
+    "maxBytes": 5000000,
+    "timeoutMs": 30000,
+    "lanes": [],                           // empty ⇒ every lane and stage once enabled
+    "search": null                         // { "endpoint": "…", "apiKeyEnv": "SEARCH_KEY" }
   }
 }
 ```
+
+### Local files in child worktrees
+
+Each child works in a `git worktree add` checkout, which contains **tracked files only**. A
+gitignored site profile or `.env` that the work genuinely needs is simply absent — and since a
+child has no shell, it cannot look one directory up or tell "missing" apart from "not here". It
+reports the file as missing, which is true and useless.
+
+`worktree.carry` therefore copies untracked files (ignored ones included) into every child
+worktree, and each lane's task names what was carried so the child knows to look. Copies, never
+symlinks, so a child edit cannot reach the operator's own file.
+
+Carried files are kept out of every git write path — the candidate patch, the snapshot lineage,
+the `claims` guard, and audit commits including `auditPaths` force-adds. Carrying a file makes it
+readable; it never makes it committable. Kanban reports the count once per run; narrow it with
+`worktree.carry` or `worktree.carryExclude`, or set `carry: "none"` to switch it off.
+
+### Network access
+
+Pi ships no built-in web tool, and Kanban children run with extensions and skills disabled, so
+without configuration a child has no network at all — including the research stage. Setting
+`network.enabled` with a non-empty `network.allow` grants `web_fetch` and `web_search` to the
+matching lanes. Children still get no shell.
+
+Every request is checked before a connection is made: https only, host on the allowlist,
+re-checked on each redirect, capped at `maxBytes`, and refused outright when the host resolves
+into loopback, link-local or private address space. Fetched bodies are delimited as untrusted
+content, and the coordinator and worker prompts state that such content is evidence to verify,
+never instruction. Every attempt is appended to `.kanban/loop/<base>.net.jsonl` with its status,
+size and content hash, so an acquisition remains attributable.
+
+`web_search` needs `network.search.endpoint`. Unconfigured, it says so rather than returning an
+empty result set a child would read as "nothing exists".
+
+Because `pi -p` accepts tool *names* on argv and has no way to receive a tool definition, enabling
+the network forces the in-process child backend even when `runner` is `"subprocess"`. The
+alternative would be to drop the tools silently, so a child would report the network as
+unreachable when it was in fact configured.
+
+### When a campaign runs out of turns
+
+`loop.maxCoordinatorTurns` caps how many times the coordinator is woken in a campaign. When it is
+reached, the run blocks with a message naming the remedy, holds every undelivered event, and
+records the escalation in `.kanban/attention.md`.
+
+Two things always remain possible from there. A user control — `/kanban say`, `/kanban goal`,
+`/kanban answer` — is delivered regardless of the budget, because the instruction that could
+raise a limit must never be the one the limit refuses. And `/kanban go --more` grants a fresh
+allowance and resumes where the campaign stopped.
+
+Budget keys edited in `/kanban config` also apply to a resumed campaign. The rest of a saved
+campaign's settings — adapters, jobs, the fitness command — still win over config on resume, so a
+config edit cannot silently redefine what "accepted" meant for evidence already collected.
 
 `models.implement` is used by the coordinator, workers, and reviewers. Kanban executes only configured `loop.validate`, `loop.metric`, named `loop.jobs` adapter commands, and opt-in iteration hooks. Commands run inside private worktrees and are never derived from `init.*`. Managed sessions use Pi's in-process SDK regardless of the planning `runner` setting; the frozen planning/critique runners are unchanged. See [managed jobs](docs/managed-jobs.md) for configuration and the adapter protocol.
 
@@ -124,7 +235,7 @@ new defaults do not override repository/global choices.
 
 ## The implement loop (opt-in)
 
-With `loop.enabled`, `/kanban implement` hands the implement stage to the orchestrator as an
+With `loop.enabled`, `/kanban go` hands the implement stage to the orchestrator as an
 iterative experiment loop instead of running it in your conversation:
 
 In interactive and RPC modes it returns after preflight and task registration. Baseline measurement

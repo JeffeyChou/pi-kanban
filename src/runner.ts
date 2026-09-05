@@ -7,6 +7,7 @@ import {
   getAgentDir,
   SessionManager,
   type AgentSessionEvent,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { KanbanConfig } from "./config.js";
 import { appendLiveOutput, updateLoopProgress } from "./liveprogress.js";
@@ -33,6 +34,14 @@ export interface ChildSpec {
   /** REQUIRED — resolved by the caller; never defaulted by the runner. */
   model: Model<any>;
   tools: string[];
+  /**
+   * Extension-owned tools, over and above the built-in `tools` names.
+   *
+   * Only the in-process backend can carry these: `pi -p` takes tool *names* on argv and has no way
+   * to receive a definition, so a caller that needs one must run in-process. `selectRunner` handles
+   * that rather than letting the subprocess backend silently drop them.
+   */
+  customTools?: ToolDefinition[];
   signal: AbortSignal;
   onStatus?: (line: string) => void;
 }
@@ -173,11 +182,13 @@ export function createInProcessRunner(): RunChild {
 
       if (spec.signal.aborted) return abortedResult();
 
+      const custom = spec.customTools ?? [];
       const created = await dependencies.createAgentSession({
         cwd: spec.cwd,
         agentDir,
         model: spec.model,
-        tools: spec.tools,
+        tools: [...spec.tools, ...custom.map((tool) => tool.name)],
+        ...(custom.length ? { customTools: custom } : {}),
         resourceLoader: loader,
         sessionManager: dependencies.SessionManager.inMemory(spec.cwd),
       });
@@ -245,6 +256,7 @@ export function createSubprocessRunner(): RunChild {
   return createSubprocessRunnerFor("pi");
 }
 
+/** Tool NAMES only: `pi -p` has no way to receive a tool definition, so `customTools` is ignored. */
 function createSubprocessRunnerFor(piBin: string): RunChild {
   return async (spec) => {
     if (spec.signal.aborted) return abortedResult();
@@ -447,7 +459,13 @@ function createSubprocessRunnerFor(piBin: string): RunChild {
 }
 
 export function selectRunner(config: KanbanConfig): RunChild {
-  return config.runner === "subprocess"
+  // Network tools are extension-owned definitions, and `pi -p` can only be handed tool names.
+  // Choosing the subprocess backend there would drop them silently, so a child would report the
+  // network as unreachable when it was in fact configured. Prefer the backend that can honor it.
+  // Optional-chained: the default is network off, so a caller predating the block gets the
+  // documented default rather than a crash.
+  const needsCustomTools = Boolean(config.network?.enabled && config.network.allow.length > 0);
+  return config.runner === "subprocess" && !needsCustomTools
     ? createSubprocessRunnerFor(config.piBin)
     : createInProcessRunner();
 }

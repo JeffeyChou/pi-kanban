@@ -24,7 +24,7 @@ import {
 import { detectExternalTools, isSingleShot } from "./capabilities.js";
 import { loadConfig, LoopRevisionSchema, validateLoopRevision, type KanbanConfig } from "./config.js";
 import { cancelCoordinatorJobs } from "./coordinator.js";
-import { readCoordination, recordControl, requestControl, wakeCoordinator, writeCoordination, type ControlRequest } from "./coordinationstore.js";
+import { grantCoordinatorTurns, readCoordination, recordControl, requestControl, resumeHint, wakeCoordinator, writeCoordination, type ControlRequest } from "./coordinationstore.js";
 import { startImplementLoop, type LoopStart } from "./implementloop.js";
 import { queryStatus } from "./status.js";
 import { deleteLoopArtifacts, readLoopRun, sweepLoopWorktrees } from "./looplog.js";
@@ -67,7 +67,7 @@ import {
   type SessionState,
   type Stage,
 } from "./store.js";
-import { refreshWidget, showDashboard, showExperimentDashboard, showComposedPlan } from "./ui.js";
+import { refreshWidget, showDashboard, showExperimentDashboard, showComposedPlan, showTextPanel } from "./ui.js";
 import {
   deleteWorkfile,
   readWorkfile,
@@ -387,12 +387,15 @@ async function implementCommand(
     return;
   }
   if (session.state !== "active") {
-    ctx.ui.notify(`Kanban session “${session.title}” is paused. Use /kanban unpause first.`, "info");
+    ctx.ui.notify(`Kanban session “${session.title}” is paused. Run /kanban unpause, then /kanban go.`, "info");
     return;
   }
   if (session.stage !== "implement") {
+    // Naming the next command matters: this is the most common way `/kanban go` looks like a
+    // silent no-op, and "wrong stage" alone leaves the operator with nothing to do about it.
     ctx.ui.notify(
-      `Kanban session “${session.title}” is at the ${session.stage} stage; /kanban implement is only valid at the implement stage.`,
+      `Kanban session “${session.title}” is at the ${session.stage} stage; /kanban go only runs at the implement stage. ` +
+      `Run /kanban check to see what the ${session.stage} stage is waiting on.`,
       "info",
     );
     return;
@@ -895,9 +898,342 @@ export default function kanban(pi: ExtensionAPI): void {
     else ctx.ui.notify("Kanban config saved.", "info");
   }
 
+  /** Create a session and hand it to the pipeline in a clean conversation. */
+  async function createCommand(ctx: ExtensionCommandContext, brief: string): Promise<void> {
+    const config = await configFor(ctx);
+    const title = await generateTitle(ctx, brief);
+    const created = await mutateAsync(ctx.cwd, async (state) => {
+      const session = await createSession(ctx.cwd, state, title);
+      session.mode = "pipeline";
+      await writePlan(ctx.cwd, session.planPath, emptyPlan(session, brief));
+      if (!(await readHandoff(ctx.cwd)))
+        await writeHandoff(ctx.cwd, buildHandoff(undefined, config.init));
+      return session;
+    });
+    await refreshWidget(ctx, created.state);
+    ctx.ui.notify(
+      `Created ${created.value.title}; opening a clean Pi conversation while the pipeline runs.`,
+      "info",
+    );
+    await startCleanConversation(ctx, created.value, {
+      afterSwitch: async (fresh) => {
+        await startPipeline(fresh, created.value.title, pipelineDeps(pi, fresh, config));
+      },
+    });
+  }
+
+  /** Steer, revise, or answer a waiting lane. All three are durable without a live coordinator. */
+  async function controlCommand(
+    ctx: ExtensionCommandContext,
+    action: ControlRequest["action"],
+    message: string,
+    verb: string,
+    lane?: string,
+  ): Promise<void> {
+    if (!message) { ctx.ui.notify(`Usage: /kanban ${verb} <message>`, "error"); return; }
+    const session = requireSelectedSession(await load(ctx.cwd));
+    const base = workfileBase(session.planPath);
+    const receipt = await requestControl(ctx.cwd, base, session.title,
+      { action, message, ...(lane ? { lane } : {}) });
+    ctx.ui.notify(
+      hasLiveRun(session.title)
+        ? receipt
+        : `${receipt} ${resumeHint(await readCoordination(ctx.cwd, base))}`,
+      "info",
+    );
+  }
+
+  /**
+   * Raise an exhausted coordinator-turn budget and resume.
+   *
+   * Without this there was no way out at all: the budget lives in the saved campaign record, so
+   * editing config could not reach a run that had already stopped, and every other command
+   * pointed the operator back at the resume that was refusing.
+   */
+  async function grantTurnsCommand(ctx: ExtensionCommandContext, extra?: number): Promise<void> {
+    const session = requireSelectedSession(await load(ctx.cwd));
+    const granted = await grantCoordinatorTurns(
+      ctx.cwd, workfileBase(session.planPath), session.title, extra);
+    ctx.ui.notify(
+      `Granted ${granted.granted} more coordinator turns (budget now ${granted.budget}); resuming “${session.title}”.`,
+      "info",
+    );
+    await implementCommand(pi, ctx, false);
+  }
+
+  async function setSessionPaused(ctx: ExtensionCommandContext, paused: boolean): Promise<void> {
+    const nextState: SessionState = paused ? "blocked" : "active";
+    const updated = await mutateAsync(ctx.cwd, async (state) => {
+      const current = requireSelectedSession(state);
+      if (current.state === nextState)
+        throw new Error(
+          paused
+            ? `Kanban session “${current.title}” is already paused`
+            : `Kanban session “${current.title}” is already active`,
+        );
+      if (paused) {
+        abortPipelineFor(current.title);
+        delete current.pipelineToken;
+      }
+      setSessionState(current, nextState);
+      await writeSessionPlan(ctx.cwd, current);
+      return current;
+    });
+    await refreshWidget(ctx, updated.state);
+    ctx.ui.notify(
+      `Kanban session “${updated.value.title}” is ${paused ? "paused" : "active"}.`,
+      "info",
+    );
+  }
+
+  /**
+   * One declarative table drives dispatch, `/kanban help`, and the unknown-verb message.
+   *
+   * They used to be three hand-maintained lists in a 150-line if-chain, and they had already
+   * drifted: the "unknown command" text omitted `steer` and `goal` entirely, so two working
+   * commands were undiscoverable. A verb that exists here is documented and listed by
+   * construction.
+   *
+   * Older names stay as aliases. Renaming a command someone has in their fingers is a cost with
+   * no benefit; the new names are only about which six are worth surfacing first.
+   */
+  interface Verb {
+    name: string;
+    aliases?: string[];
+    args?: string;
+    summary: string;
+    /** Shown by `/kanban help <verb>`. */
+    detail?: string;
+    /** Everyday commands are listed first; the rest live under `/kanban more`. */
+    everyday?: boolean;
+    run: (ctx: ExtensionCommandContext, body: string) => Promise<void>;
+  }
+
+  const requireNoBody = (verb: string, body: string, ctx: ExtensionCommandContext): boolean => {
+    if (!body) return true;
+    ctx.ui.notify(`Usage: /kanban ${verb}`, "error");
+    return false;
+  };
+
+  const VERBS: Verb[] = [
+    {
+      name: "new", aliases: ["create"], args: "<brief>", everyday: true,
+      summary: "Start a session and run the planning pipeline on it.",
+      detail: "Generates a title, creates the session, and opens a clean Pi conversation while refine → research → grill → compose run in the background. This is where every session begins.",
+      run: async (ctx, body) => {
+        if (!body) { ctx.ui.notify("Usage: /kanban new <brief>", "error"); return; }
+        await createCommand(ctx, body);
+      },
+    },
+    {
+      name: "go", aliases: ["implement"], args: "[stop | --more[=N]]", everyday: true,
+      summary: "Run or resume the implement stage.",
+      detail: [
+        "With no argument, starts or resumes the implement run for the selected session.",
+        "`stop` cancels the live run and its scheduler jobs; nothing is landed.",
+        "`--more` grants another coordinator-turn budget when — and only when — the campaign",
+        "stopped because it ran out of turns. It refuses on any other blocker, so it cannot",
+        "paper over a campaign that stopped for a substantive reason.",
+      ].join(" "),
+      run: async (ctx, body) => {
+        if (body === "stop") { await implementCommand(pi, ctx, true); return; }
+        if (body) {
+          const grant = /^--more(?:[= ](\d+))?$/.exec(body);
+          if (!grant) { ctx.ui.notify("Usage: /kanban go [stop | --more[=N]]", "error"); return; }
+          await grantTurnsCommand(ctx, grant[1] ? Number(grant[1]) : undefined);
+          return;
+        }
+        await implementCommand(pi, ctx, false);
+      },
+    },
+    {
+      name: "check", aliases: ["status"], args: "[view]", everyday: true,
+      summary: "Read what the background work is doing, attention first.",
+      detail: [
+        "Views: attention, summary (the default), output, results, plan.",
+        "The default summary leads with anything waiting on you; `attention` shows only those open",
+        "items — the blocker and its remedy, unanswered child questions, failed jobs, and events the",
+        "coordinator has not yet consumed. Long output is rendered in a scrollable panel, not a",
+        "notification that truncates and then disappears.",
+      ].join(" "),
+      run: async (ctx, body) => {
+        const views = ["summary", "attention", "output", "results", "plan"];
+        if (body && !views.includes(body)) {
+          ctx.ui.notify(`Usage: /kanban check [${views.join(" | ")}]`, "error");
+          return;
+        }
+        const view = (body || "summary") as "summary" | "attention" | "output" | "results" | "plan";
+        await showTextPanel(ctx, `Kanban ${view}`, await queryStatus(ctx.cwd, { view }));
+      },
+    },
+    {
+      name: "say", aliases: ["steer"], args: "<message>", everyday: true,
+      summary: "Send an instruction to the implement coordinator.",
+      detail: "Recorded durably and delivered even when the campaign is out of budget: a user message is the one thing a spending limit must never block. Use `goal` instead to change the objective or the run settings.",
+      run: async (ctx, body) => controlCommand(ctx, "steer", body, "say"),
+    },
+    {
+      name: "help", args: "[verb]", everyday: true,
+      summary: "What each command does, and the path through a session.",
+      run: async (ctx, body) => showTextPanel(ctx, "Kanban help", helpText(body)),
+    },
+    {
+      name: "more", everyday: true,
+      summary: "List the commands beyond the everyday ones.",
+      run: async (ctx, body) => {
+        if (!requireNoBody("more", body, ctx)) return;
+        await showTextPanel(ctx, "Kanban commands", helpText(""));
+      },
+    },
+    {
+      name: "answer", args: "<lane> <message>",
+      summary: "Answer a child agent that is waiting on a question.",
+      detail: "A worker that hits a decision it cannot make stops and waits. `check attention` lists which lane is waiting and what it asked. The answer is recorded even when no coordinator is live, and is delivered when the run resumes.",
+      run: async (ctx, body) => {
+        const [lane, ...rest] = body.split(/\s+/);
+        const message = rest.join(" ").trim();
+        if (!lane || !message) {
+          ctx.ui.notify("Usage: /kanban answer <lane> <message> — see /kanban check attention for waiting lanes.", "error");
+          return;
+        }
+        await controlCommand(ctx, "reply", message, "answer", lane);
+      },
+    },
+    {
+      name: "goal", args: "<message>",
+      summary: "Revise the objective, scope, or run settings.",
+      detail: "Queues a goal revision. The coordinator applies it with a complete updated plan, invalidating acceptance that no longer holds.",
+      run: async (ctx, body) => controlCommand(ctx, "revise", body, "goal"),
+    },
+    {
+      name: "open", args: "[title]",
+      summary: "Open or resume a session in a clean conversation.",
+      run: async (ctx, body) => {
+        const title = body || requireSelectedSession(await load(ctx.cwd)).title;
+        await openSession(pi, ctx, title);
+      },
+    },
+    {
+      name: "plan",
+      summary: "Read the composed plan for the selected session.",
+      run: async (ctx, body) => {
+        if (!requireNoBody("plan", body, ctx)) return;
+        await showComposedPlan(ctx, requireSelectedSession(await load(ctx.cwd)));
+      },
+    },
+    {
+      name: "progress", aliases: ["experiments"],
+      summary: "Live experiment table: attempts, metrics, and lane state.",
+      run: async (ctx, body) => {
+        if (!requireNoBody("progress", body, ctx)) return;
+        const session = requireSelectedSession(await load(ctx.cwd));
+        await showExperimentDashboard(ctx, workfileBase(session.planPath), session);
+      },
+    },
+    {
+      name: "config",
+      summary: "Edit .kanban/config.json in your editor.",
+      detail: "Opens the merged configuration. Budget limits edited here now take effect on a resumed campaign, which is how you raise a limit the run has already hit.",
+      run: async (ctx, body) => {
+        if (!requireNoBody("config", body, ctx)) return;
+        await configCommand(ctx);
+      },
+    },
+    {
+      name: "complete",
+      summary: "Confirm a pending archive at the critique stage.",
+      run: async (ctx, body) => {
+        if (!requireNoBody("complete", body, ctx)) return;
+        await completeCommand(ctx);
+      },
+    },
+    {
+      name: "pause",
+      summary: "Pause the selected session and stop its live run.",
+      run: async (ctx, body) => {
+        if (!requireNoBody("pause", body, ctx)) return;
+        await setSessionPaused(ctx, true);
+      },
+    },
+    {
+      name: "unpause",
+      summary: "Make the selected session active again.",
+      run: async (ctx, body) => {
+        if (!requireNoBody("unpause", body, ctx)) return;
+        await setSessionPaused(ctx, false);
+      },
+    },
+    {
+      name: "remove",
+      summary: "Permanently delete the selected session and its artifacts.",
+      run: async (ctx, body) => {
+        if (!requireNoBody("remove", body, ctx)) return;
+        await removeSessionPermanently(ctx, requireSelectedSession(await load(ctx.cwd)).title);
+      },
+    },
+  ];
+
+  function findVerb(name: string): Verb | undefined {
+    return VERBS.find((verb) => verb.name === name || verb.aliases?.includes(name));
+  }
+
+  /** Left column width shared by every listed row, so the summaries line up in one column. */
+  function verbColumn(verbs: Verb[]): number {
+    return verbs.reduce(
+      (width, verb) => Math.max(width, `/kanban ${[verb.name, verb.args].filter(Boolean).join(" ")}`.length),
+      "/kanban".length,
+    ) + 2;
+  }
+
+  function verbLine(verb: Verb, width: number): string {
+    return `  ${`/kanban ${[verb.name, verb.args].filter(Boolean).join(" ")}`.padEnd(width)}${verb.summary}`;
+  }
+
+  /** `body` names one verb, or is empty for the whole listing. */
+  function helpText(body: string): string {
+    const requested = body.trim() ? findVerb(body.trim()) : undefined;
+    if (body.trim() && !requested)
+      return `No Kanban command named “${body.trim()}”.\n\n${helpText("")}`;
+    if (requested)
+      return [
+        `/kanban ${[requested.name, requested.args].filter(Boolean).join(" ")}`,
+        "",
+        requested.summary,
+        ...(requested.detail ? ["", requested.detail] : []),
+        ...(requested.aliases?.length ? ["", `Also accepted: ${requested.aliases.map((alias) => `/kanban ${alias}`).join(", ")}`] : []),
+      ].join("\n");
+
+    const everyday = VERBS.filter((verb) => verb.everyday);
+    const rest = VERBS.filter((verb) => !verb.everyday);
+    const width = verbColumn(VERBS);
+    return [
+      "Kanban runs long research and implementation work in the background, in private git",
+      "worktrees, and reports back here. A session moves through six stages; you drive it with",
+      "these commands.",
+      "",
+      "A session, start to finish:",
+      "  1. /kanban new <brief>               describe the work; planning runs on its own",
+      "  2. /kanban check                     see where it got to, and anything waiting on you",
+      "  3. /kanban go                        run the implement stage",
+      "  4. /kanban say <message>             correct course while it runs",
+      "  5. /kanban answer <lane> <message>   unblock a child that asked a question",
+      "  6. /kanban complete                  archive it once the critique gate passes",
+      "",
+      "Everyday commands:",
+      `  ${"/kanban".padEnd(width)}Open the session board.`,
+      ...everyday.map((verb) => verbLine(verb, width)),
+      "",
+      "Everything else:",
+      ...rest.map((verb) => verbLine(verb, width)),
+      "",
+      "Details for one command: /kanban help <verb>",
+      "Configuration lives in .kanban/config.json — edit it with /kanban config.",
+    ].join("\n");
+  }
+
   pi.registerCommand("kanban", {
     description:
-      "Open the durable Kanban dashboard, create a session, open/resume one, start or stop the implement loop, edit config, complete a pending archive, or pause/remove the current session",
+      "Manage background Kanban research and implementation sessions. Run /kanban help for the full list.",
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       const [verb, ...rest] = trimmed ? trimmed.split(/\s+/) : [];
@@ -907,149 +1243,15 @@ export default function kanban(pi: ExtensionAPI): void {
           await runDashboard(pi, ctx);
           return;
         }
-
-        if (verb === "create") {
-          if (!body) {
-            ctx.ui.notify("Usage: /kanban create <brief>", "error");
-            return;
-          }
-          const config = await configFor(ctx);
-          const title = await generateTitle(ctx, body);
-          const created = await mutateAsync(ctx.cwd, async (state) => {
-            const session = await createSession(ctx.cwd, state, title);
-            session.mode = "pipeline";
-            await writePlan(ctx.cwd, session.planPath, emptyPlan(session, body));
-            if (!(await readHandoff(ctx.cwd)))
-              await writeHandoff(ctx.cwd, buildHandoff(undefined, config.init));
-            return session;
-          });
-          await refreshWidget(ctx, created.state);
+        const found = findVerb(verb);
+        if (!found) {
           ctx.ui.notify(
-            `Created ${created.value.title}; opening a clean Pi conversation while the pipeline runs.`,
-            "info",
-          );
-          await startCleanConversation(ctx, created.value, {
-            afterSwitch: async (fresh) => {
-              await startPipeline(
-                fresh,
-                created.value.title,
-                pipelineDeps(pi, fresh, config),
-              );
-            },
-          });
-          return;
-        }
-
-        if (verb === "open") {
-          const title = body || requireSelectedSession(await load(ctx.cwd)).title;
-          await openSession(pi, ctx, title);
-          return;
-        }
-
-        if (verb === "implement") {
-          if (body && body !== "stop") {
-            ctx.ui.notify("Usage: /kanban implement [stop]", "error");
-            return;
-          }
-          await implementCommand(pi, ctx, body === "stop");
-          return;
-        }
-
-        if (verb === "status") {
-          if (body && !["summary", "output", "results", "plan"].includes(body)) {
-            ctx.ui.notify("Usage: /kanban status [summary|output|results|plan]", "error");
-            return;
-          }
-          ctx.ui.notify(await queryStatus(ctx.cwd, { view: (body || "summary") as "summary" | "output" | "results" | "plan" }), "info");
-          return;
-        }
-
-        if (verb === "steer" || verb === "goal") {
-          if (!body) { ctx.ui.notify(`Usage: /kanban ${verb} <message>`, "error"); return; }
-          const session = requireSelectedSession(await load(ctx.cwd));
-          ctx.ui.notify(await requestControl(ctx.cwd, workfileBase(session.planPath), session.title,
-            { action: verb === "goal" ? "revise" : "steer", message: body }), "info");
-          return;
-        }
-
-        if (verb === "plan") {
-          if (body) { ctx.ui.notify("Usage: /kanban plan", "error"); return; }
-          await showComposedPlan(ctx, requireSelectedSession(await load(ctx.cwd)));
-          return;
-        }
-
-        if (verb === "experiments" || verb === "progress") {
-          if (body) {
-            ctx.ui.notify(`Usage: /kanban ${verb}`, "error");
-            return;
-          }
-          const session = requireSelectedSession(await load(ctx.cwd));
-          await showExperimentDashboard(ctx, workfileBase(session.planPath), session);
-          return;
-        }
-
-        if (verb === "config") {
-          if (body) {
-            ctx.ui.notify("Usage: /kanban config", "error");
-            return;
-          }
-          await configCommand(ctx);
-          return;
-        }
-
-        if (verb === "complete") {
-          if (body) {
-            ctx.ui.notify("Usage: /kanban complete", "error");
-            return;
-          }
-          await completeCommand(ctx);
-          return;
-        }
-
-        if (verb === "pause" || verb === "unpause") {
-          if (body) {
-            ctx.ui.notify(`Usage: /kanban ${verb}`, "error");
-            return;
-          }
-          const nextState: SessionState = verb === "pause" ? "blocked" : "active";
-          const updated = await mutateAsync(ctx.cwd, async (state) => {
-            const current = requireSelectedSession(state);
-            if (current.state === nextState)
-              throw new Error(
-                nextState === "blocked"
-                  ? `Kanban session “${current.title}” is already paused`
-                  : `Kanban session “${current.title}” is already active`,
-              );
-            if (nextState === "blocked") {
-              abortPipelineFor(current.title);
-              delete current.pipelineToken;
-            }
-            setSessionState(current, nextState);
-            await writeSessionPlan(ctx.cwd, current);
-            return current;
-          });
-          await refreshWidget(ctx, updated.state);
-          ctx.ui.notify(
-            `Kanban session “${updated.value.title}” is ${nextState === "blocked" ? "paused" : "active"}.`,
-            "info",
+            `No Kanban command named “${verb}”. Everyday: ${VERBS.filter((entry) => entry.everyday).map((entry) => entry.name).join(", ")}. Run /kanban help for all of them.`,
+            "error",
           );
           return;
         }
-
-        if (verb === "remove") {
-          if (body) {
-            ctx.ui.notify("Usage: /kanban remove", "error");
-            return;
-          }
-          const state = await load(ctx.cwd);
-          await removeSessionPermanently(ctx, requireSelectedSession(state).title);
-          return;
-        }
-
-        ctx.ui.notify(
-          "Unknown Kanban command. Use /kanban, /kanban create, /kanban open, /kanban implement, /kanban status, /kanban plan, /kanban progress, /kanban experiments, /kanban config, /kanban complete, /kanban pause, /kanban unpause, or /kanban remove.",
-          "error",
-        );
+        await found.run(ctx, body);
       } catch (error: unknown) {
         ctx.ui.notify(
           error instanceof Error ? error.message : "Unable to manage Kanban session",
@@ -1250,11 +1452,14 @@ export default function kanban(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "kanban_status",
     label: "Kanban Status",
-    description: "Read the selected Kanban task's current status, output, experiment results, or plan without interrupting background work. Use when the user asks; never poll or wait for the task to finish.",
+    description: "Read the selected Kanban task's current status, open items needing an answer, output, experiment results, or plan without interrupting background work. Use when the user asks; never poll or wait for the task to finish.",
     promptSnippet: "Answer questions about background Kanban work with a read-only snapshot.",
-    promptGuidelines: ["When asked for progress or results, query once and answer, leaving the background task running. Do not monitor repeatedly or resume implementation in the main conversation merely to check status."],
+    promptGuidelines: [
+      "When asked for progress or results, query once and answer, leaving the background task running. Do not monitor repeatedly or resume implementation in the main conversation merely to check status.",
+      "Before resuming a coordinator that is not live, read view \"attention\" first. A blocker, an unanswered child question or an unhandled event will otherwise stop the resumed run immediately, for a reason the summary view does not show.",
+    ],
     parameters: Type.Object({
-      view: Type.Optional(StringEnum(["summary", "output", "results", "plan"] as const)),
+      view: Type.Optional(StringEnum(["summary", "attention", "output", "results", "plan"] as const)),
       iteration: Type.Optional(Type.Integer({ minimum: 1, description: "A completed experiment iteration to inspect; omit for the latest results." })),
     }),
     async execute(_id, input, _signal, _update, ctx) {
@@ -1277,8 +1482,10 @@ export default function kanban(pi: ExtensionAPI): void {
       if (input.loop) validateLoopRevision(input.loop);
       if (input.action !== "revise" && (input.loop || input.inScope || input.outOfScope)) throw new Error("Settings and scope changes require action revise");
       const session = requireSelectedSession(await load(ctx.cwd));
-      const receipt = await requestControl(ctx.cwd, workfileBase(session.planPath), session.title, input);
-      return toolResult(`${receipt}${hasLiveRun(session.title) ? "" : " No coordinator is live in this Pi process; use /kanban implement to resume and apply it."}`);
+      const base = workfileBase(session.planPath);
+      const receipt = await requestControl(ctx.cwd, base, session.title, input);
+      if (hasLiveRun(session.title)) return toolResult(receipt);
+      return toolResult(`${receipt} ${resumeHint(await readCoordination(ctx.cwd, base))}`);
     },
   });
 

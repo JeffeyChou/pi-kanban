@@ -180,7 +180,7 @@ export function renderSelected(
   live: LiveWidgetState = { contextWindow: 0, tokens: 0, primaryWorking: false },
 ): string[] {
   const view = snapshot(state, live);
-  if (!view) return ["No active Kanban session. Use /kanban create <prompt>."];
+  if (!view) return ["No active Kanban session. Use /kanban new <brief>, or /kanban help."];
   return [
     `☐ ${view.title}`,
     `  ◉ Stage ${view.stageNumber}/${STAGES.length} · ${view.stage}`,
@@ -207,7 +207,7 @@ export async function refreshWidget(
   const usage = view ? getUsage(ctx.cwd, view.title) : undefined;
   ctx.ui.setStatus?.("kanban-usage", usage ? usageLines(usage)[0] : undefined);
   if (!view) {
-    ctx.ui.setWidget("kanban", ["No active Kanban session. Use /kanban create <prompt>."], {
+    ctx.ui.setWidget("kanban", ["No active Kanban session. Use /kanban new <brief>, or /kanban help."], {
       placement: "aboveEditor",
     });
     return;
@@ -322,7 +322,7 @@ export async function showDashboard(
         if (!sessions.length)
           return panelLines(
             "Kanban dashboard",
-            ["No active Kanban sessions.", "Use /kanban create <brief> to start one.", "", "Esc to close"],
+            ["No active Kanban sessions.", "Use /kanban new <brief> to start one.", "Use /kanban help for what the commands do.", "", "Esc to close"],
             width,
           ).map((line, index) =>
             index === 0 ? theme.fg("accent", theme.bold(line)) : line,
@@ -358,6 +358,7 @@ export async function showDashboard(
           managing
             ? "Enter open · r rename · x remove · Tab return · Esc close"
             : "↑/↓ or j/k move · Enter open · Tab manage · Esc close",
+          managing ? "" : "/kanban check for status · /kanban help for commands",
         ];
         return panelLines(
           managing
@@ -529,14 +530,22 @@ export async function showExperimentDashboard(
 }
 
 /** Inspect the composed Markdown plan without switching conversations or mutating it. */
-export async function showComposedPlan(ctx: ExtensionCommandContext, session: Session): Promise<void> {
-  const body = (await readWorkfile(ctx.cwd, workfileBase(session.planPath))).sections.compose;
-  if (!body?.trim()) {
-    ctx.ui.notify(`No composed plan is recorded for “${session.title}” yet.`, "info");
+/**
+ * A scrollable read-only panel.
+ *
+ * `ctx.ui.notify` is a one-line toast. Status answers run to thousands of characters, so pushing
+ * one through notify truncates it into uselessness and then discards it on the next redraw —
+ * which is why the status views went unread. Anything long belongs here instead.
+ */
+export async function showTextPanel(
+  ctx: ExtensionCommandContext, title: string, body: string,
+): Promise<void> {
+  if (!body.trim()) {
+    ctx.ui.notify("Nothing to show.", "info");
     return;
   }
   if (!ctx.hasUI || ctx.mode === "rpc") {
-    ctx.ui.notify(`## compose\n${body}`, "info");
+    ctx.ui.notify(body, "info");
     return;
   }
   await ctx.ui.custom<void>((tui, theme, keys, done) => {
@@ -548,7 +557,7 @@ export async function showComposedPlan(ctx: ExtensionCommandContext, session: Se
         const lines = wrapped(body, width);
         total = lines.length;
         offset = Math.min(offset, Math.max(0, total - page));
-        return panelLines(`Plan · ${session.title}`, [
+        return panelLines(title, [
           ...lines.slice(offset, offset + page), "",
           `${offset + 1}–${Math.min(total, offset + page)} / ${total} display lines · ↑/↓ scroll · PgUp/PgDn page · Esc closes`,
         ], width).map((line, index) => index === 0 ? theme.fg("accent", theme.bold(line)) : line);
@@ -564,4 +573,13 @@ export async function showComposedPlan(ctx: ExtensionCommandContext, session: Se
       },
     };
   });
+}
+
+export async function showComposedPlan(ctx: ExtensionCommandContext, session: Session): Promise<void> {
+  const body = (await readWorkfile(ctx.cwd, workfileBase(session.planPath))).sections.compose;
+  if (!body?.trim()) {
+    ctx.ui.notify(`No composed plan is recorded for “${session.title}” yet.`, "info");
+    return;
+  }
+  await showTextPanel(ctx, `Plan · ${session.title}`, `## compose\n${body}`);
 }

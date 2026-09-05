@@ -321,3 +321,52 @@ test("planning controls merge independently and reject invalid depth/detail/time
     assert.equal(loaded.warnings.length, 4);
   } finally { await rm(cwd, { recursive: true, force: true }); }
 });
+
+test("worktree and network blocks default, merge, and reject invalid values with warnings", async () => {
+  const cwd = await sandbox();
+  const agentDir = join(cwd, "agent");
+  try {
+    await mkdir(join(agentDir, "extensions"), { recursive: true });
+    await mkdir(join(cwd, ".kanban"), { recursive: true });
+
+    // Defaults: carrying on (a child that cannot see local config cannot work), network off
+    // (an agent that can fetch is a different trust proposition and must be chosen).
+    const bare = await loadConfig(cwd, agentDir);
+    assert.deepEqual(bare.config.worktree, { carry: "all", carryExclude: [], carryMaxBytes: 10_485_760 });
+    assert.deepEqual(bare.config.network,
+      { enabled: false, allow: [], maxBytes: 5_000_000, timeoutMs: 30_000, lanes: [] });
+
+    await writeFile(join(agentDir, "extensions", "kanban.json"), JSON.stringify({
+      worktree: { carryMaxBytes: 1024 },
+      network: { enabled: true, allow: ["github.com"] },
+    }));
+    await writeFile(join(cwd, ".kanban", "config.json"), JSON.stringify({
+      worktree: { carry: ["cluster/*/site.env"], carryExclude: ["evidence/**"] },
+      network: { lanes: ["research"], search: { endpoint: "https://s.example/api", apiKeyEnv: "SEARCH_KEY" } },
+    }));
+
+    const merged = await loadConfig(cwd, agentDir);
+    assert.deepEqual(merged.warnings, []);
+    assert.deepEqual(merged.config.worktree,
+      { carry: ["cluster/*/site.env"], carryExclude: ["evidence/**"], carryMaxBytes: 1024 },
+      "project values override the user layer field by field");
+    assert.equal(merged.config.network.enabled, true, "the user layer still supplies enablement");
+    assert.deepEqual(merged.config.network.allow, ["github.com"]);
+    assert.deepEqual(merged.config.network.lanes, ["research"]);
+    assert.equal(merged.config.network.search?.apiKeyEnv, "SEARCH_KEY");
+
+    await writeFile(join(cwd, ".kanban", "config.json"), JSON.stringify({
+      worktree: { carry: "sometimes", carryMaxBytes: -1, nope: 1 },
+      network: { enabled: "yes", allow: "github.com", timeoutMs: 10 },
+    }));
+    const invalid = await loadConfig(cwd, agentDir);
+    const warnings = invalid.warnings.join("\n");
+    for (const field of ["carry", "carryMaxBytes", "nope", "enabled", "allow", "timeoutMs"])
+      assert.match(warnings, new RegExp(field), `${field} must be reported`);
+    // Invalid values are ignored, never applied: a malformed allowlist must not widen access.
+    assert.deepEqual(invalid.config.network.allow, ["github.com"]);
+    assert.equal(invalid.config.worktree.carryMaxBytes, 1024);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});

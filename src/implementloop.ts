@@ -38,6 +38,7 @@ import {
   capturePatch,
   commitAudit,
   commitExperiment,
+  carryIntoWorktree,
   createDetachedWorktree,
   ensureExperimentBranch,
   experimentBranchHead,
@@ -267,11 +268,16 @@ async function openWorktree(
   if (saved?.iteration === iteration && saved.status !== "finished" && saved.worktree === path) {
     const head = await headCommit(path);
     if (head !== bestCommit) return { ok: false, error: "Recoverable iteration worktree moved; inspect it before resuming" };
+    // Carry again on recovery. The common reason a campaign is being resumed at all is that a
+    // child reported a file missing and the operator has just supplied it; a worktree that only
+    // ever carried at creation time would still not have it.
+    await carryIntoWorktree(cwd, path, setup.config.worktree);
     await registerWorktree(cwd, setup.base, { path, pid: process.pid, startedAt: new Date().toISOString(), retain: true });
     return { ok: true, path };
   }
   const created = await createDetachedWorktree(cwd, bestCommit, path);
   if (!created.ok) return { ok: false, error: created.error ?? "git worktree add failed" };
+  await carryIntoWorktree(cwd, path, setup.config.worktree);
   await registerWorktree(cwd, setup.base, {
     path,
     pid: process.pid,
@@ -439,6 +445,7 @@ async function runIteration(
       outcome = await setup.coordinate({
         handle: setup.handle, base: setup.base, iteration: input.iteration, worktree,
         goal: setup.prompt, spec: setup.spec ?? "", loop: setup.loop, model: setup.handle.model(),
+        worktreeConfig: setup.config.worktree, network: setup.config.network,
         bestMetric: input.bestMetric, lessons: input.lessons, hookNote: input.hookNote,
         factory: setup.sessionFactory, command: setup.jobCommand, measure: setup.measure,
       });
@@ -857,6 +864,33 @@ async function driveLoop(setup: LoopSetup): Promise<LoopResult> {
 
 /* -------------------------------------- arming -------------------------------------- */
 
+/**
+ * Budget keys an operator raises deliberately in `/kanban config`. They have no default, so an
+ * `undefined` here genuinely means "not configured" rather than "left at the built-in value".
+ */
+const RESUMABLE_BUDGET_KEYS = [
+  "maxCoordinatorTurns",
+  "maxChildRuns",
+  "maxSubmissions",
+  "maxConcurrentChildren",
+] as const;
+
+/**
+ * Campaign state wins on resume — adapters, jobs and the fitness command belong to the running
+ * experiment, and a config edit must not silently redefine what "accepted" meant for evidence
+ * already collected. Budgets are the exception: they are spending limits the operator owns, and
+ * a saved snapshot that outranks a fresh edit leaves an exhausted campaign with no way out,
+ * because raising the limit in config would have no effect on the run that needs it raised.
+ */
+export function resumeLoopConfig(saved: LoopConfig, configured: LoopConfig): LoopConfig {
+  const merged: LoopConfig = { ...saved };
+  for (const key of RESUMABLE_BUDGET_KEYS) {
+    const value = configured[key];
+    if (value !== undefined) merged[key] = value;
+  }
+  return merged;
+}
+
 function refuse(
   ctx: ExtensionCommandContext,
   message: string,
@@ -899,12 +933,12 @@ export async function startImplementLoop(
   if (!loop.enabled)
     return refuse(
       ctx,
-      "The Kanban implement loop is disabled. Set loop.enabled in /kanban config to use it.",
+      "The Kanban implement loop is disabled. Run /kanban config and set loop.enabled to true, or run /kanban open to implement in the conversation instead.",
     );
   if (!fitnessConfigured(loop))
     return refuse(
       ctx,
-      "The Kanban implement loop needs a fitness signal: set loop.validate (a command whose exit code decides), loop.metric, or managed loop.jobs in /kanban config.",
+      "The Kanban implement loop needs a fitness signal before it can judge an iteration. Run /kanban config and set loop.validate (a command whose exit code decides), loop.metric, or a managed loop.jobs adapter.",
     );
 
   const state = await load(ctx.cwd);
@@ -916,7 +950,7 @@ export async function startImplementLoop(
   if (!currentHead)
     return refuse(
       ctx,
-      "The Kanban implement loop needs a Git repository with at least one commit.",
+      "The Kanban implement loop needs a Git repository with at least one commit. Run git init and commit once, then /kanban go.",
       "error",
     );
   // The git helpers throw when git itself fails; a preflight probe that cannot answer must
@@ -934,20 +968,22 @@ export async function startImplementLoop(
   if (modified.length)
     return refuse(
       ctx,
-      `The Kanban implement loop needs a clean working tree: ${modified.length} tracked file(s) are modified. Commit or stash them first.`,
+      `The Kanban implement loop needs a clean working tree: ${modified.length} tracked file(s) are modified (${modified.slice(0, 3).join(", ")}${modified.length > 3 ? ", …" : ""}). ` +
+      `Commit or stash them, then run /kanban go. The loop refuses here because it lands accepted work by patch, and uncommitted changes would be mixed into it.`,
     );
 
   const base = workfileBase(session.planPath);
   // Approved live revisions are campaign state, not necessarily a repository-config edit.
   // Restore their budgets and adapters before deciding whether another iteration can run.
   const savedCoordinator = await readCoordination(ctx.cwd, base);
-  if (savedCoordinator) loop = savedCoordinator.loop;
+  if (savedCoordinator) loop = resumeLoopConfig(savedCoordinator.loop, deps.config.loop);
   const existing = await readLoopRun(ctx.cwd, base);
   const baseCommit = existing?.baseCommit ?? currentHead;
   if (existing && currentHead !== baseCommit)
     return refuse(
       ctx,
-      `The saved autoresearch run is based on ${baseCommit.slice(0, 12)}, but HEAD is now ${currentHead.slice(0, 12)}. Restore that base or start a new Kanban session rather than mixing histories.`,
+      `The saved autoresearch run is based on ${baseCommit.slice(0, 12)}, but HEAD is now ${currentHead.slice(0, 12)}. ` +
+      `Run git checkout ${baseCommit.slice(0, 12)} to restore that base, or /kanban new to start a session on the current HEAD. Mixing the two histories would land the run's patches onto a tree they were never tested against.`,
     );
   const branch = existing?.branch ?? `kanban-autoresearch/${base}`;
   // Config decides whether an audit trail is kept; a saved run only decides its ref name.
@@ -1035,6 +1071,10 @@ export async function startImplementLoop(
       if (!created.ok) {
         throw new Error(`The Kanban implement loop could not create its baseline worktree: ${created.error ?? "git worktree add failed"}.`);
       }
+      // The baseline runs the same fitness command every iteration runs. A validate script that
+      // sources a gitignored site profile has to find it here too, or the baseline measures a
+      // different thing than the iterations it is compared against.
+      await carryIntoWorktree(ctx.cwd, baselinePath, deps.config.worktree);
       await registerWorktree(ctx.cwd, base, {
         path: baselinePath,
         pid: process.pid,

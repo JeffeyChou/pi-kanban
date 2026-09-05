@@ -510,3 +510,116 @@ test("delegated children start without waiting for the coordinator's response to
     abortPipelineFor(h.title); await run;
   } finally { await h.cleanup(); }
 });
+
+test("an exhausted coordinator-turn budget blocks with its remedy and holds every event for resume", { timeout: 20000 }, async () => {
+  const h = await harness({
+    // One turn, so the second wake has nothing left to spend.
+    loop: { maxCoordinatorTurns: 1 },
+    coordinator: async (packet, spec) => {
+      if (!packet.lanes.length)
+        await invoke(spec, "iteration_delegate", {
+          name: "writer", task: "Change app.ts", role: "worker",
+          acceptance: "value is 1", claims: ["app.ts"],
+        });
+    },
+  });
+  try {
+    const { run } = await h.start();
+    const result = await run;
+
+    const state = await h.read();
+    assert.equal(state.status, "blocked");
+    // "budget exhausted" alone is indistinguishable from a campaign that cannot continue.
+    assert.match(state.blocker!, /coordinator-turn budget exhausted \(1\/1\)/);
+    assert.match(state.blocker!, /\/kanban go --more/);
+    assert.match(result.message ?? "", /coordinator-turn budget exhausted/);
+
+    // The writer's completion must survive: a top-up resumes where this stopped, and work that
+    // was silently dropped at the budget wall could never be recovered.
+    assert.ok(state.events.some((event) => !event.handled),
+      "events must be held unhandled for delivery on resume");
+
+    const attention = await queryStatus(h.cwd, { view: "attention" });
+    assert.match(attention, /ATTENTION/);
+    assert.match(attention, /coordinator-turn budget exhausted/);
+
+    const escalated = await readFile(join(h.cwd, ".kanban", "attention.md"), "utf8");
+    assert.match(escalated, /coordinator-turn budget exhausted/);
+    assert.match(escalated, /Remedy: \/kanban go --more/);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("a user control is delivered even when the coordinator-turn budget is spent", { timeout: 25000 }, async () => {
+  const delivered: string[] = [];
+  const h = await harness({
+    loop: { maxCoordinatorTurns: 1 },
+    coordinator: async (packet, spec) => {
+      for (const event of packet.events ?? [])
+        if (String(event.kind).startsWith("user_")) delivered.push(String(event.message));
+      if (!packet.lanes.length)
+        await invoke(spec, "iteration_delegate", {
+          name: "writer", task: "Change app.ts", role: "worker",
+          acceptance: "value is 1", claims: ["app.ts"],
+        });
+    },
+  });
+  try {
+    await (await h.start()).run;
+    assert.match((await h.read()).blocker!, /coordinator-turn budget exhausted/);
+
+    // Exactly the situation from the field: the operator's instruction arrives at a campaign that
+    // has already spent its budget. The budget must not be what swallows it, or the one command
+    // that could raise the limit is the one the limit refuses to deliver.
+    await requestControl(h.cwd, h.base, h.title, { action: "steer", message: "Use the carried site.env" });
+    await (await h.start()).run;
+
+    assert.ok(
+      delivered.some((message) => message.includes("Use the carried site.env")),
+      `the steer must reach the coordinator; delivered=${JSON.stringify(delivered)}`,
+    );
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("a waiting lane's question reaches the attention view and can be answered with no live run", { timeout: 25000 }, async () => {
+  const h = await harness({
+    coordinator: async (packet, spec) => {
+      if (!packet.lanes.length)
+        await invoke(spec, "iteration_delegate", {
+          name: "writer", task: "Change app.ts", role: "worker",
+          acceptance: "value is 1", claims: ["app.ts"],
+        });
+    },
+    worker: async (spec) => {
+      await invoke(spec, "iteration_question", { question: "Which site profile should I use?" });
+      return "Asked and stopped.";
+    },
+  });
+  try {
+    const { run } = await h.start();
+    await until(async () => (await h.read())?.lanes?.writer?.state === "waiting", "the lane to ask");
+
+    const attention = await queryStatus(h.cwd, { view: "attention" });
+    assert.match(attention, /writer is waiting for an answer: Which site profile should I use\?/);
+    assert.match(attention, /\/kanban answer writer/);
+    assert.match(await queryStatus(h.cwd, { view: "summary" }), /ATTENTION/,
+      "the summary must lead with anything waiting on the operator");
+
+    // Stop the run, then answer. Nothing is live, which is precisely when a stopped campaign used
+    // to become unrecoverable: the answer has to land in the durable record regardless.
+    abortPipelineFor(h.title);
+    await run;
+    assert.equal(hasLiveRun(h.title), false);
+
+    await requestControl(h.cwd, h.base, h.title,
+      { action: "reply", lane: "writer", message: "Use cluster/site/site.env" });
+    const state = await h.read();
+    assert.equal(state.lanes.writer!.reply, "Use cluster/site/site.env");
+    assert.ok(state.events.some((event) => event.kind === "user_reply" && !event.handled));
+  } finally {
+    await h.cleanup();
+  }
+});
